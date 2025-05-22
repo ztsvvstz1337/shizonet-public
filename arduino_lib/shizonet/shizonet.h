@@ -2064,7 +2064,7 @@ public:
         return cmd_buf->ticketid;
     }
 
-    shznet_ticketid send_get(const char* cmd, byte* data, size_t size, shznet_pkt_dataformat fmt = SHZNET_PKT_FMT_DATA, shznet_response_callback cb = [](byte*, size_t, shznet_pkt_dataformat, bool) {}, uint64_t timeout = 0);
+    shznet_ticketid send_get(const char* cmd, byte* data = 0, size_t size = 0, shznet_pkt_dataformat fmt = SHZNET_PKT_FMT_DATA, shznet_response_callback cb = [](byte*, size_t, shznet_pkt_dataformat, bool) {}, uint64_t timeout = 0);
 
     bool send_finished(shznet_ticketid id, std::function<void(bool)> cb = 0)
     {
@@ -2552,6 +2552,7 @@ class shznet_artnet_device
         {
             universe_buffer = std::vector<byte>(512 * 17); //+1 just in case someone buffer overruns
             memset(universe_buffer.data(), 0, universe_buffer.size());
+            memset(dirty, 0, 16);
         }
     };
 
@@ -2874,6 +2875,8 @@ protected:
 
     std::vector < std::pair<shznet_mac, const char*>> m_pending_disconnect;
 
+    std::vector<shznet_device_ptr> m_devices_temp;
+
     artnet_poll     art_poll;
     artnet_sync     art_sync;
     artnet_dmx      art_dmx_buffer;
@@ -2946,7 +2949,6 @@ protected:
     bool            send_artnet_sync = true;
     int             artnet_send_group = 0;
     shznet_timer    artnet_delay = shznet_timer(2); //target to send 16 universes at 60 FPS with 4 universes every 2 milliseconds
-    bool            artnet_sync_frame = false;
 
     bool m_shizonet_enabled = true;
 
@@ -2983,8 +2985,19 @@ public:
     void cancel_ticket(shznet_ticketid tid)
     {
         NETPRNT_ERR("ticket cancelled.");
-        for (auto& it : m_devices)
-            it.second->clear_command_buffer(tid, true, false);
+        m_devices_temp.clear();
+        for (auto it : m_devices)
+        {
+            if(it.second)
+                m_devices_temp.push_back(it.second);
+        }
+
+        for (auto it : m_devices_temp)
+        {
+            if(it)
+                it->clear_command_buffer(tid, true, false);
+        }
+        m_devices_temp.clear();
     }
 
     virtual void update() override
@@ -3166,33 +3179,28 @@ public:
                     ++it;
             }
 
-            for (auto& it : m_wait_responses_tmp)
+            for (auto it : m_wait_responses_tmp)
             {
                 cancel_ticket(it.id);
                 if(it.cb) it.cb(0, 0, SHZNET_PKT_FMT_INVALID, 0);
             }
         }
       
-        if (artnet_delay.update())
+        if (artnet_send_group >= 0)
         {
-            if (artnet_send_group == 4)
-            {
-                //printf("send delay: %i\n", (int)artnet_send_debug.delay());
-                if (send_artnet_sync && artnet_sync_frame)
-                {
-                    artnet_sync_frame = false;
-                    send_art_sync(shznet_broadcast_ip);
-                }
-
-                artnet_send_group = 0;
-            }
-            else
+            if (artnet_delay.update())
             {
                 for (auto it : m_artnet_devices)
                 {
                     it.second->update(artnet_send_group);
                 }
+
                 artnet_send_group++;
+
+                if (artnet_send_group >= 4)
+                {
+                    artnet_send_group = -1;
+                }
             }
         }
 
@@ -3207,6 +3215,29 @@ public:
                     send_auth_req(it.second);
             }
         }
+    }
+
+    void artnet_sync_now()
+    {
+        if (artnet_send_group != -1)
+        {
+            for (int i = artnet_send_group; i < 4; i++)
+            {
+                for (auto &it : m_artnet_devices)
+                {
+                    it.second->update(i);
+                }
+            }
+        }
+
+        if (send_artnet_sync)
+        {
+            send_art_sync(shznet_broadcast_ip);
+            artnet_delay.reset();
+        }
+
+        //framesync now and start sending next data (one frame delay? can that be avoided?)
+        artnet_send_group = 0;
     }
 
     void disconnect_device(shznet_mac& id, const char* reason)

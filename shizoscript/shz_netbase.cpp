@@ -393,7 +393,14 @@ public:
 		scriptFunction("start_logging", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
 			{
 				if (!obj->m_device) { result.initInt(0);  return; }
-				obj->m_device->send_get("debug_log", 0, 0);
+				obj->m_device->send_get("debug_log");
+				result.initInt(0);
+			}, 0, true, false, "()");
+
+		scriptFunction("stop_logging", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				if (!obj->m_device) { result.initInt(0);  return; }
+				obj->m_device->send_get("debug_log_stop");
 				result.initInt(0);
 			}, 0, true, false, "()");
 
@@ -1579,6 +1586,9 @@ public:
 					}
 
 					result.returnError("no device.");
+
+					//temp fix, force sleep to for 1 sec to avoid spam
+
 					return;
 				}
 
@@ -1725,8 +1735,8 @@ public:
 
 		scriptFunction("artnet_sync", [](ShizoNetBase* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
 			{
-				obj->artnet_sync_frame = true;
-				obj->artnet_send_group = 0;
+				obj->artnet_sync_now();
+
 			}, 0, true, false, "()");
 }
 };
@@ -1758,7 +1768,6 @@ shz_module_loader loader_netbase([](shzscript* s)
 				ESP.restart();
 			});
 #endif
-
 		ShizoNetBase::global_base->add_command_respond("debug_log", [s](std::shared_ptr<shznet_responder> r)
 			{
 				auto dev = r->device_ptr();
@@ -1770,7 +1779,7 @@ shz_module_loader loader_netbase([](shzscript* s)
 				SLH_Instance()->addLogCB([dev, sid](ScriptLogType type, char* str)
 					{
 						SCRIPTAUTOLOCK();
-						if (!dev->valid() || dev->get_sessionid() != sid)
+						if (!dev->valid() || !dev->online() || dev->get_sessionid() != sid)
 							return false;
 
 						static int log_feedback_fix;
@@ -1819,6 +1828,8 @@ void shz_netbase_remote(shzscript* s, std::function<bool(const char*)> run_scrip
 }
 #endif
 
+//NOT NEEDED IN NEWER ARDUINO VERSIONS, UNCOMMENT IF ERROR
+/*
 #ifdef __XTENSA__
 #include "esp_random.h"
 //FIX FOR ESP32 S3
@@ -1828,3 +1839,4 @@ int getentropy(void* buffer, size_t length)
 	return 0;
 }
 #endif
+*/

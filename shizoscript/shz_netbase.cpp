@@ -880,6 +880,20 @@ public:
 
 			}, 3, true, false, "(universe, index, value)");
 
+		scriptFunction("get_artnet_channel", [](ShizoArtnetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				if (params.size() != 2)
+					return;
+
+				if (!obj->m_device) { return; }
+
+				int universe = params[0]->get_int();
+				int start_adr = params[1]->get_int();
+
+				result.initInt(obj->m_device->get_artnet_buffer(universe, start_adr));
+
+			}, 2, true, false, "(universe, index)");
+
 		scriptFunction("clear_artnet_buffer", [](ShizoArtnetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
 			{
 				if (obj->m_device)

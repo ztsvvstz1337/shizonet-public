@@ -735,6 +735,8 @@ enum shznet_ack_request_type : uint16_t
     shznet_ack_request_ping,
     shznet_ack_request_quick_resend,
     shznet_ack_request_resend,
+    shznet_ack_request_busy, 
+    shznet_ack_request_too_big
 };
 
 struct shznet_pkt_ack
@@ -871,6 +873,13 @@ struct shznet_command_defs
     uint32_t hash;
     uint16_t type;
     uint16_t reserved;
+}PACKED_ATTR;
+
+struct shznet_buffer_defs
+{
+    uint32_t hash;
+    uint32_t type;
+    uint32_t size;
 }PACKED_ATTR;
 
 #pragma pack(pop) // Restore the previous packing
@@ -1122,6 +1131,7 @@ class shznet_recycler
 {
     shznet_vector<T*>	m_garbage;
     uint32_t		    m_count = 0;
+    uint32_t            m_in_use = 0;
 public:
 
     ~shznet_recycler()
@@ -1133,6 +1143,11 @@ public:
     uint32_t total_count()
     {
         return m_count;
+    }
+
+    uint32_t in_use()
+    {
+        return m_in_use;
     }
 
     void recycle(T* object)
@@ -1147,11 +1162,13 @@ public:
             return;
         }
 #endif
+        m_in_use--;
         m_garbage.push_back(object);
     }
 
     T* get()
     {
+        m_in_use++;
         if (m_garbage.size())
         {
             T* result = m_garbage.back();
@@ -1906,9 +1923,9 @@ public:
         add_data(key, (byte*)&value, sizeof(value), SHZNET_PKT_FMT_FLOAT64);
     }
 
-    void add(const char* key, shznet_kv_writer& other)
+    void add_kv(const char* key, shznet_kv_writer& other)
     {
-        add_data(key, other.get_buffer().data(), other.get_buffer().size());
+        add_data(key, other.get_buffer().data(), other.get_buffer().size(), SHZNET_PKT_FMT_KEY_VALUE);
     }
 
     void clear()
@@ -1929,11 +1946,18 @@ class shznet_kv_reader
     shznet_pkt_dataformat fmt;
     byte* value = 0;
     size_t value_size = 0;
+
 public:
 
-    shznet_kv_reader(byte* _data, size_t _size) : data(_data), size(_size)
+    shznet_kv_reader(byte* _data = 0, size_t _size = 0)
     {
+        init(_data, _size);
+    }
 
+    void init(byte* _data, size_t _size)
+    {
+        data = _data;
+        size = _size;
     }
 
     bool read()
@@ -1957,11 +1981,15 @@ public:
 
     bool read_key(const char* key)
     {
+        if (strcmp(get_key(), key) == 0)
+            return true;
+
         while (read())
         {
             if (strcmp(get_key(), key) == 0)
                 return true;
         }
+
         //reset index and try again...
         index = 0;
         while (read())
@@ -1998,6 +2026,12 @@ public:
     {
         if (!read_key(key)) return "";
         return (const char*)get_value();
+    }
+
+    const byte* read_data(const char* key)
+    {
+        if (!read_key(key)) return 0;
+        return (const byte*)get_value();
     }
 
     int16_t read_int16(const char* key)
@@ -2099,6 +2133,14 @@ public:
             break;
         }
         return 0;
+    }
+
+    shznet_kv_reader read_kv(const char* key)
+    {
+        auto kv_data = read_data(key);
+        if (get_fmt() != SHZNET_PKT_FMT_KEY_VALUE)
+            return shznet_kv_reader();
+        return shznet_kv_reader((byte*)kv_data, get_value_size());
     }
 };
 

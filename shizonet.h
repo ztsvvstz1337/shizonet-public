@@ -1,23 +1,33 @@
 #pragma once
 
 #include "shizonet_platform.h"
+#define SHZNET_COMPAT_VERSION 14
+#undef min
 
-//TODO: find a better (secure) way to do this...
 #ifdef __XTENSA__
+//TODO: find a better (secure) way to do this...
 #define ESP32_OTA
 extern char* ota_class;
 extern char* ota_subclass;
+#define SHZNET_MAX_RECV (1024 * 10) //10kb
+#define SHZNET_MAX_RECV_BUFFERS (3) //3 Buffers (~30kb)
+#define SHZNET_MAX_RECV_OOB (1024 * 10) //10kb OOB data 
+#else
+#define SHZNET_MAX_RECV (-1)
+#define SHZNET_MAX_RECV_BUFFERS (-1)
+#define SHZNET_MAX_RECV_OOB (1024 * 1024) //1mb OOB data 
 #endif
-
-#define SHZNET_COMPAT_VERSION 1.3
-
-//#define ESP_ETH
-
-#undef min
 
 #define INVALID_SESSIONID shznet_sessionid(-1)
 #define INVALID_TICKETID shznet_ticketid(-1)
 
+struct shznet_config
+{
+    uint64_t max_recv = SHZNET_MAX_RECV; //Maximum number of mb that can be requested by a client
+    uint64_t max_recv_buffers = SHZNET_MAX_RECV_BUFFERS;
+    uint64_t max_recv_oob = SHZNET_MAX_RECV_OOB;
+
+};
 
 struct shznet_channel_buffer
 {
@@ -165,10 +175,14 @@ struct shznet_stream_endpoint_s
     }
 };
 
-
 class shznet_receiver
 {
+public:
+
+    shznet_config config;
+
 protected:
+
     shznet_udp m_udp;
 
     std::string m_nodename = "DEFAULT";
@@ -211,6 +225,8 @@ protected:
 
     int            m_missed_artnet_pkts = 0;
     uint64_t        m_next_frame_recv_time = 0;
+
+    volatile bool m_order_check_flag = 0;
 
 public:
 
@@ -354,6 +370,11 @@ public:
 
     virtual void update()
     {
+        if (order_update.update())
+        {
+            m_order_check_flag = true;
+        }
+
         if (artnet_frame_due && artnet_frame_timer.check())
         {
             artnet_frame_due = 0;
@@ -605,6 +626,13 @@ public:
                 if (!pkt->get_data_size_max())
                     return;
 
+                //fix potential attack point here with setting a max data size etc...
+                if (config.max_recv_oob != (-1) && pkt->get_data_size_max() >= config.max_recv_oob)
+                {
+                    NETPRNT("OOB cmd is too big!");
+                    return;
+                }
+
                 //no point in allocating a buffer for a cmd which doesnt exist...
                 auto cb = m_callbacks.find(pkt->get_cmd());
                 if (cb == m_callbacks.end())
@@ -616,7 +644,6 @@ public:
                 endpoint->second.oob.seq = 1; //next seq
                 endpoint->second.oob.max_seq = pkt->header.seq_max;
 
-                //fix potential attack point here with setting a max data size etc...
                 endpoint->second.oob.buffer.resize(pkt->get_data_size_max());
 
                 endpoint->second.oob.write_data(pkt->get_data(), pkt->get_data_size());
@@ -630,6 +657,7 @@ public:
                 NETPRNT("received invalid oob cmd!");
                 return;
             }
+
             cb->second(adr, pkt->get_data(), pkt->get_data_size(), pkt->header);           
         }
     }
@@ -669,6 +697,7 @@ public:
 
         shznet_mac target_mac(pkt->source_mac());
         bool found_endpoint = m_endpoints.find(target_mac) != m_endpoints.end();
+
         auto& endpoint = m_endpoints[target_mac];
         endpoint.reset();
 
@@ -888,8 +917,9 @@ public:
 
         //CLEANUP
 
-        if (order_update.update())
+        if (m_order_check_flag)
         {
+            m_order_check_flag = false;
             for (auto &it : m_endpoints)
             {
                 auto& orders = it.second.orders;
@@ -939,6 +969,37 @@ public:
             buff = entry->second;
         else
         {
+            if (config.max_recv_buffers != (-1) && order_buffers.in_use() >= config.max_recv_buffers)
+            {
+                NETPRNT("Max recv buffers reached!");
+                shznet_pkt_ack ack;
+                ack.sessionid = pkt->header.sessionid;
+                ack.ticketid = pkt->header.ticketid;
+                memcpy(ack.mac, local_mac().mac, 6);
+                ack.type = shznet_ack_request_busy;
+                ack.missing_start_id = -1;
+                ack.missing_end_id = -1;
+                ack.ack_id = 0;
+                ack.make_checksum();
+                m_udp.send_buffered_prio(adr, (byte*)&ack, sizeof(shznet_pkt_ack));
+                return;
+            }
+            else if (config.max_recv != (-1) && pkt->header.data_max_size > config.max_recv)
+            {
+                NETPRNT("Max recv!");
+                shznet_pkt_ack ack;
+                ack.sessionid = pkt->header.sessionid;
+                ack.ticketid = pkt->header.ticketid;
+                memcpy(ack.mac, local_mac().mac, 6);
+                ack.type = shznet_ack_request_too_big;
+                ack.missing_start_id = -1;
+                ack.missing_end_id = -1;
+                ack.ack_id = 0;
+                ack.make_checksum();
+                m_udp.send_buffered_prio(adr, (byte*)&ack, sizeof(shznet_pkt_ack));
+                return;
+            }
+
             buff = order_buffers.get();
             buff->address.ip = adr;
             buff->address.mac = pkt->source_mac();
@@ -1273,6 +1334,7 @@ public:
                 ack.make_checksum();
                 m_udp.send_buffered_prio(adr, (byte*)&ack, sizeof(shznet_pkt_ack));
             }
+         
         }
         else //order not found, request to resend the whole order...
         {
@@ -1488,8 +1550,12 @@ class shznet_device
         shznet_timer start_time;
         shznet_vector<shznet_pkt> pkts;
         shznet_timer ping_timer;
+
         bool start_ack;
         bool start_cleanup;
+
+        bool device_busy = false;
+        shznet_timer device_busy_timer = shznet_timer(1000 * 2);
 
         std::vector<bool> missing_chunks;
         uint64_t missing_chunk_low = -1;
@@ -1737,6 +1803,8 @@ protected:
         cmd_buf->error_counter = 0;
         cmd_buf->ack_id = 1;
 
+        cmd_buf->device_busy = false;
+
         cmd_buf->start_time.reset();
 
         return cmd_buf;
@@ -1748,6 +1816,7 @@ public:
 
     std::unordered_map<uint32_t, std::string> command_map;
     std::unordered_map<uint32_t, std::string> command_response_map;
+    std::unordered_map<uint32_t, std::pair<std::string, shznet_buffer_defs>> network_buffer_map;
 
     shznet_device(shznet_base_impl* _base, shznet_adr& adr, std::string _name = "", std::string _description = "")
     {
@@ -2207,21 +2276,26 @@ public:
                 }
                 if (ordered_buffers.size())
                 {
-                    auto state = send_command_buffer(ordered_buffers.front());
-                    flush_buffer = true;
-                    if (state == command_buffer_sending)
-                        keep_sending = true;
-                    else if (state == command_buffer_send_fail)
-                        break;
-                    max_queries++;
-
-                    if (ordered_buffers.size() >= 2 && ordered_buffers.front()->start_cleanup)
+                    if (!ordered_buffers.front()->device_busy || ordered_buffers.front()->device_busy_timer.update())
                     {
-                        auto zombie_buffer = ordered_buffers.front();
-                        ordered_buffers.pop();
-                        zombie_buffers.push(zombie_buffer);
-                        keep_sending = true;
-                        continue;
+                        ordered_buffers.front()->device_busy = false;
+
+                        auto state = send_command_buffer(ordered_buffers.front());
+                        flush_buffer = true;
+                        if (state == command_buffer_sending)
+                            keep_sending = true;
+                        else if (state == command_buffer_send_fail)
+                            break;
+                        max_queries++;
+
+                        if (ordered_buffers.size() >= 2 && ordered_buffers.front()->start_cleanup)
+                        {
+                            auto zombie_buffer = ordered_buffers.front();
+                            ordered_buffers.pop();
+                            zombie_buffers.push(zombie_buffer);
+                            keep_sending = true;
+                            continue;
+                        }
                     }
                 }
             }
@@ -2237,6 +2311,12 @@ public:
                 for (auto it = unordered_buffers.begin(); it != unordered_buffers.end(); )
                 {
                     auto buf = *it;
+                    
+                    if (buf->device_busy && !buf->device_busy_timer.update())
+                        continue;
+                    
+                    buf->device_busy = false;
+
                     if (buf->timeout && buf->timeout_counter.update())
                     {
                         handle_response_failed(buf->ticketid);
@@ -2375,7 +2455,7 @@ public:
             else
                 cmd_buff->missing_chunk_high = std::max(pkt->missing_end_id, cmd_buff->missing_chunk_high);
         }
-        else if (pkt->type == shznet_ack_request_complete)
+        else if (pkt->type == shznet_ack_request_complete || pkt->type == shznet_ack_request_too_big)
         {
             if (pkt->missing_start_id == -2 && pkt->missing_end_id == -2) //order not found (no pkt arrived on single packet cmds for example)
             {
@@ -2430,6 +2510,11 @@ public:
                 cmd_buff->ack_id++;
                 return;
             }
+        }
+        else if (pkt->type == shznet_ack_request_busy)
+        {
+            cmd_buff->device_busy = true;
+            cmd_buff->device_busy_timer.reset();
         }
         
     }
@@ -2782,6 +2867,26 @@ public:
         return;
     }
 
+    uint8_t get_artnet_buffer(int universe, int start_adr)
+    {
+        int dmx_max = 512;
+
+        // Adjust starting address to be within the current universe.
+        while (start_adr >= dmx_max)
+        {
+            universe++;
+            start_adr -= dmx_max;
+        }
+
+        if (universe < 0 || universe >= 16)
+            return 0;
+
+        if (start_adr < 0 || start_adr >= 512)
+            return 0;
+
+        return artnet_buffer->universe_buffer[universe * 512 + start_adr];
+    }
+
     void send_art_current(int artnet_send_group) //4*4 = 16 universes sent sequentially
     {
         if (!artnet_buffer.allocated())
@@ -2944,13 +3049,18 @@ protected:
         return tid;
     }
 
-    int m_poll_probe = 1; //for different PORTS
+    int             m_poll_probe = 1; //for different PORTS
 
     bool            send_artnet_sync = true;
     int             artnet_send_group = 0;
     shznet_timer    artnet_delay = shznet_timer(2); //target to send 16 universes at 60 FPS with 4 universes every 2 milliseconds
 
-    bool m_shizonet_enabled = true;
+    bool            m_shizonet_enabled = true;
+
+                    //This is not used yet, the correct way for this to work
+                    //would be to obtain all IP addresses from all interfaces
+                    //And send broadcast messages to all of that addresses from all interfaces
+    bool            m_poll_broadcast_subnet_switch = false;
 
 public:
 
@@ -3016,14 +3126,14 @@ public:
                     NETPRNT_FMT("testing device %s.\n", dev_ptr->get_name().c_str());
                     auto tid = dev_ptr->send_get(
                         SHZNET_TEST_CMD,
-                        (byte*)"1",
-                        1,
+                        0,0,
                         SHZNET_PKT_FMT_DATA,
                         [this, dev_ptr](byte* data, size_t size, shznet_pkt_dataformat fmt, bool success) {
                             if (!success || !size) {
                                 disconnect_device(dev_ptr->get_mac(), "init connection failed.");
                                 return;
                             }
+
                             dev_ptr->command_map.clear();
                             dev_ptr->command_response_map.clear();
 
@@ -3039,24 +3149,53 @@ public:
                                 return;
                             }
 
-                            uint32_t version = *(uint32_t*)kvr.get_value();
+                            //This is kinda ugly and we could do better, but keep it for now for compatibility (deprecated, use kvr.read_int32() in future)
+                            auto version = *(uint32_t*)kvr.get_value();
 
-                            while (kvr.read()) {
-                                if (kvr.get_value_size() != sizeof(shznet_command_defs)) {
-                                    NETPRNT("command def invalid size!");
-                                    continue;
+                            if (version != 1)
+                            {
+                                auto cmds = kvr.read_kv("commands");
+                                while (cmds.read())
+                                {
+                                    shznet_command_defs* def = (shznet_command_defs*)cmds.get_value();
+                                    if (def && cmds.get_value_size() == sizeof(shznet_command_defs))
+                                    {
+                                        if (!def->type) {
+                                            dev_ptr->command_map[def->hash] = cmds.get_key();
+                                        }
+                                        else {
+                                            dev_ptr->command_response_map[def->hash] = cmds.get_key();
+                                        }
+                                    }
                                 }
-                                shznet_command_defs* def = (shznet_command_defs*)kvr.get_value();
-                                if (!def->type) {
-                                    dev_ptr->command_map[def->hash] = kvr.get_key();
+
+                                auto buffers = kvr.read_kv("buffers");
+                                while (buffers.read())
+                                {
+                                    shznet_buffer_defs* def = (shznet_buffer_defs*)buffers.get_value();
+                                    if (def && buffers.get_value_size() == sizeof(shznet_buffer_defs))
+                                    {
+                                        dev_ptr->network_buffer_map[def->hash] = std::make_pair(buffers.get_key(), *def);
+                                    }
                                 }
-                                else {
-                                    dev_ptr->command_response_map[def->hash] = kvr.get_key();
+                            }
+                            else //old compatibility
+                            {
+                                while (kvr.read()) {
+                                    if (kvr.get_value_size() != sizeof(shznet_command_defs)) {
+                                        NETPRNT("command def invalid size!");
+                                        continue;
+                                    }
+                                    shznet_command_defs* def = (shznet_command_defs*)kvr.get_value();
+                                    if (!def->type) {
+                                        dev_ptr->command_map[def->hash] = kvr.get_key();
+                                    }
+                                    else {
+                                        dev_ptr->command_response_map[def->hash] = kvr.get_key();
+                                    }
                                 }
                             }
 
-                            //this is after command defs for compatibility with older versions...
-                            //update this whole thing one day (use read_key etc)
                             dev_ptr->_has_shizoscript_json = kvr.read_int32("has_json");
 
                             dev_ptr->was_connected = true;
@@ -3497,8 +3636,18 @@ public:
 
     void send_art_poll()
     {
-        shznet_ip adr((short)ART_NET_PORT);
-        m_udp.send_packet_artnet(adr, (uint8_t*)&art_poll, sizeof(artnet_poll));
+        if (!m_poll_broadcast_subnet_switch)
+        {
+            shznet_ip adr((short)ART_NET_PORT);
+            m_udp.send_packet_artnet(adr, (uint8_t*)&art_poll, sizeof(artnet_poll));
+        }
+        else
+        {
+            shznet_ip adr = local_ip();
+            adr.ip[3] = 255;
+            adr.port = ART_NET_PORT;
+            m_udp.send_packet_artnet(adr, (uint8_t*)&art_poll, sizeof(artnet_poll));
+        }
 
         if (m_udp.local_adr().ip.port != ART_NET_PORT)
         {
@@ -3508,11 +3657,14 @@ public:
         }
 
 #ifdef _WIN32
-        adr.ip[0] = 127;
-        adr.ip[1] = 0;
-        adr.ip[2] = 0;
-        adr.ip[3] = 1;
-        m_udp.send_packet_artnet(adr, (uint8_t*)&art_poll, sizeof(artnet_poll));
+        {
+            shznet_ip adr((short)ART_NET_PORT);
+            adr.ip[0] = 127;
+            adr.ip[1] = 0;
+            adr.ip[2] = 0;
+            adr.ip[3] = 1;
+            m_udp.send_packet_artnet(adr, (uint8_t*)&art_poll, sizeof(artnet_poll));
+        }
 #endif
     }
 
@@ -3532,11 +3684,22 @@ public:
 
         uint32_t pkt_size = m_send_buffer.packet_end();
 
-        shznet_ip adr((short)ART_NET_PORT);
-        m_udp.send_packet(adr, (uint8_t*)&m_send_buffer, pkt_size);
+        if (!m_poll_broadcast_subnet_switch)
+        {
+            shznet_ip adr((short)ART_NET_PORT);
+            m_udp.send_packet(adr, (uint8_t*)&m_send_buffer, pkt_size);
+        }
+        else
+        {
+            shznet_ip adr = local_ip();
+            adr.ip[3] = 255;
+            adr.port = ART_NET_PORT;
+            m_udp.send_packet(adr, (uint8_t*)&m_send_buffer, pkt_size);
+        }
 
         if (m_udp.local_adr().ip.port != ART_NET_PORT)
         {
+            shznet_ip adr((short)ART_NET_PORT);
             adr.port = m_udp.local_adr().ip.port;
             m_udp.send_packet(adr, (uint8_t*)&m_send_buffer, pkt_size);
             int port_delta = m_udp.local_adr().ip.port - ART_NET_PORT;
@@ -3748,17 +3911,34 @@ public:
 #include "mbedtls/sha256.h"
 #endif
 
+//Network buffers, need documentation, basically copy a buffer that is hardware bound on a device (say LED data) and create a local copy of that buffer.
+//When data is written locally, send dirty parts of the buffer to the device to update.
+enum NETWORK_BUFFER_TYPE
+{
+    NETWORK_BUFFER_RECV,
+    NETWORK_BUFFER_SYNC
+};
+
 class shznet_base : public shznet_base_impl
 {
+    struct network_buffer
+    {
+        NETWORK_BUFFER_TYPE type;
+        byte*   data;
+        size_t  size;
+    };
+
 protected:
     friend class shznet_device;
     
     //local stuff
     std::vector<std::unique_ptr<pending_device_respond_msg>> m_pending_device_responds; //this is used in case another device sends a respond request but is not yet connected to us, execute as soon as it is connected!
    
-    std::unordered_map<uint32_t, std::function<void(std::shared_ptr<shznet_responder>)>> m_response_callbacks;
+    std::unordered_map<uint32_t, std::function<void(std::shared_ptr<shznet_responder>)>>    m_response_callbacks;
+    std::unordered_map<uint32_t, std::string>                                               m_response_command_names;
 
-    std::unordered_map<uint32_t, std::string> m_response_command_names;
+    std::unordered_map<uint32_t, network_buffer>    m_network_buffers;
+    std::unordered_map<uint32_t, std::string>       m_network_buffer_names;
 
     void handle_response_recv(shznet_device_ptr dev, uint32_t cmd, shznet_ticketid id, byte* data, size_t size, shznet_pkt_dataformat fmt)
     {
@@ -3829,23 +4009,39 @@ public:
                 kvw.clear();
 
                 kvw.add_int32("version", SHZNET_COMPAT_VERSION);
-                
-                shznet_command_defs def;
+                kvw.add_int32("has_json", _has_shizoscript_json);
+
+                shznet_kv_writer kvw_sub;
 
                 for (auto& it : m_command_names)
                 {
+                    shznet_command_defs def;
+                    memset(&def, 0, sizeof(def));
                     def.hash = it.first;
                     def.type = 0;
-                    kvw.add_data(it.second.c_str(), (byte*)&def, sizeof(def));
+                    kvw_sub.add_data(it.second.c_str(), (byte*)&def, sizeof(def));
                 }
                 for (auto& it : m_response_command_names)
                 {
+                    shznet_command_defs def;
+                    memset(&def, 0, sizeof(def));
                     def.hash = it.first;
                     def.type = 1;
-                    kvw.add_data(it.second.c_str(), (byte*)&def, sizeof(def));
+                    kvw_sub.add_data(it.second.c_str(), (byte*)&def, sizeof(def));
                 }
+                kvw.add_kv("commands", kvw_sub);
 
-                kvw.add_int32("has_json", _has_shizoscript_json);
+                kvw_sub.clear();
+                for (auto& it : m_network_buffers)
+                {
+                    shznet_buffer_defs bdef;
+                    memset(&bdef, 0, sizeof(bdef));
+                    bdef.hash = it.first;
+                    bdef.size = it.second.size;
+                    bdef.type = (uint32_t)it.second.type;
+                    kvw_sub.add_data(m_network_buffer_names[it.first].c_str(), (byte*)&bdef, sizeof(bdef));
+                }
+                kvw.add_kv("buffers", kvw_sub);
 
                 responder->respond(kvw);
             });
@@ -4117,6 +4313,13 @@ public:
         if (m_response_command_names.find(hs) != m_response_command_names.end()) m_response_command_names.erase(hs);
     }
 
+    void add_buffer(NETWORK_BUFFER_TYPE type, const char* name, void* data, size_t size)
+    {
+        auto hs = shznet_hash((char*)name, strlen(name));
+        m_network_buffers[hs] = { type, (byte*)data, size };
+        m_network_buffer_names[hs] = name;
+    }
+
     virtual void update() override
     {
 #ifdef ESP32_OTA
@@ -4237,6 +4440,8 @@ public:
 
             if(m_shizonet_enabled)
                 send_shz_poll();
+
+            //m_poll_broadcast_subnet_switch ^= 1;
 
             /*
             shznet_ip broadcast(m_udp.local_adr().ip.port);

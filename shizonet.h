@@ -2313,8 +2313,11 @@ public:
                     auto buf = *it;
                     
                     if (buf->device_busy && !buf->device_busy_timer.update())
+                    {
+                        it++;
                         continue;
-                    
+                    }
+
                     buf->device_busy = false;
 
                     if (buf->timeout && buf->timeout_counter.update())
@@ -2466,8 +2469,6 @@ public:
                 cmd_buff->start_cleanup = 0;
                 cmd_buff->missing_chunk_low = -1;
                 cmd_buff->missing_chunk_high = -1;
-
-                update(-1);
                 return;
             }
 

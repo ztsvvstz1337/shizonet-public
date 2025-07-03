@@ -342,6 +342,8 @@ struct shznet_adr
 
 uint64_t shznet_millis();
 uint32_t shznet_hash(char* data, size_t size);
+uint32_t shznet_hash(const char* str);
+uint32_t shznet_hash(std::string& str);
 
 extern shznet_ip shznet_broadcast_ip;
 extern shznet_mac shznet_broadcast_mac;
@@ -1228,6 +1230,14 @@ public:
     }
 };
 
+enum network_buffer_static_type
+{
+    NETWORK_BUFFER_STATIC_DATA = 0,
+    NETWORK_BUFFER_STATIC_LEDS_1CH = 1,
+    NETWORK_BUFFER_STATIC_LEDS_2CH = 2, //Just for convenience, 
+    NETWORK_BUFFER_STATIC_LEDS_3CH = 3,
+    NETWORK_BUFFER_STATIC_LEDS_4CH = 4
+};
 
 template<const int _BUFF_SIZE, const int _BUFF_MAX, class BufferMarkerHeader> class shznet_async_buffer
 {
@@ -1941,8 +1951,8 @@ class shznet_kv_reader
     byte* data;
     size_t size;
     size_t index = 0;
+    const char* key;
 
-    char* key = 0;
     shznet_pkt_dataformat fmt;
     byte* value = 0;
     size_t value_size = 0;
@@ -1951,6 +1961,7 @@ public:
 
     shznet_kv_reader(byte* _data = 0, size_t _size = 0)
     {
+        key = "";
         init(_data, _size);
     }
 
@@ -1958,6 +1969,11 @@ public:
     {
         data = _data;
         size = _size;
+        index = 0;
+        if (_data && _size)
+            key = (char*)&data[index];
+        else
+            key = "";
     }
 
     bool read()

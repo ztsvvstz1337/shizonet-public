@@ -121,12 +121,6 @@ void shznet_device::flush_send_buffers()
 
 shznet_ticketid shznet_device::send_get(const char* cmd, byte* data, size_t size, shznet_pkt_dataformat fmt, shznet_response_callback cb, uint64_t timeout)
 {
-    if (receiver_only)
-    {
-        NETPRNT("error, device is a receiver only!");
-        return INVALID_TICKETID;
-    }
-
     auto tid = send_response(SHZNET_RESPONSE_CMD, shznet_hash((char*)cmd,strlen(cmd)), data, size, fmt, true);
     if (tid != INVALID_TICKETID)
     {
@@ -144,6 +138,46 @@ shznet_ticketid shznet_device::send_get(const char* cmd, byte* data, size_t size
 
     return tid;
 }
+
+void shznet_device::send_fetch(const char* cmd, byte* data, size_t size, shznet_pkt_dataformat fmt, shznet_response_callback cb, uint64_t timeout)
+{
+    auto fetch = std::make_shared<fetch_command_s>(cmd, data, size, fmt, cb, timeout);
+
+    send_fetch(fetch);
+}
+
+void shznet_device::send_fetch(std::shared_ptr<fetch_command_s> fetch_cmd)
+{
+    if (!fetch_cmd)
+        return;
+
+    auto tid = send_response(SHZNET_RESPONSE_CMD, shznet_hash((char*)fetch_cmd->command.c_str(), fetch_cmd->command.length()), fetch_cmd->buffer.data(), fetch_cmd->buffer.size(), fetch_cmd->format, true);
+
+    if (tid != INVALID_TICKETID)
+    {
+        base->handle_response_add(shznet_base_impl::response_wait(tid, get_mac(), fetch_cmd->callback, 1000 * 10));
+
+        send_finished(tid, [this, tid, fetch_cmd](bool success)
+            {
+                if (!success)
+                {
+                    if (fetch_cmd->timeout_timer.update())
+                    {
+                        NETPRNT_ERR("response cmd failed!");
+                        base->handle_response_failed(tid);
+                        return;
+                    }
+
+                    fetch_commands.push_back(fetch_cmd);
+                }
+            });
+    }
+    else
+    {
+        fetch_commands.push_back(fetch_cmd);
+    }
+}
+
 
 bool shznet_device::sendto(void* buffer, size_t size)
 {
@@ -220,6 +254,16 @@ uint32_t shznet_hash(char* data, size_t size)
         hash += (uint32_t)data[i];
 */
     return hash;
+}
+
+uint32_t shznet_hash(const char* str)
+{
+    return shznet_hash((char*)str, strlen(str));
+}
+
+uint32_t shznet_hash(std::string& str)
+{
+    return shznet_hash((char*)str.c_str(), str.length());
 }
 
 

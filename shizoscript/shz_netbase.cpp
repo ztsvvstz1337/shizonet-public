@@ -419,7 +419,77 @@ public:
 				if (!obj->m_device) { result.initString("");  return; }
 				result.initString(obj->m_device->get_ip().str().c_str());
 			}, 0, true, false, "()");
-		
+
+		scriptFunction("get_static_buffer_names", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				auto jh = result.get_json(true);
+				if (!obj->m_device) { return; }
+
+				auto names = obj->m_device->get_static_buffer_names();
+
+				for (auto& it : names)
+				{
+					auto sub = jh->push_var(it)->get_json(true);
+					sub->push_string(obj->m_device->get_static_buffer_desc(it), "description");
+					sub->push_string(obj->m_device->get_static_buffer_setup(it), "setup");
+					sub->push_int(obj->m_device->get_static_buffer_size(it), "size");
+
+					switch (obj->m_device->get_static_buffer_type(it))
+					{
+					case NETWORK_BUFFER_STATIC_DATA:
+						sub->push_string("data", "type");
+						break;
+					case NETWORK_BUFFER_STATIC_LEDS_1CH:
+						sub->push_string("led_1ch", "type");
+						break;
+					case NETWORK_BUFFER_STATIC_LEDS_3CH:
+						sub->push_string("led_3ch", "type");
+						break;
+					case NETWORK_BUFFER_STATIC_LEDS_4CH:
+						sub->push_string("led_4ch", "type");
+						break;
+					default:
+						break;
+					}
+				}
+
+			}, 0, true, false, "()");
+		scriptFunction("set_static_buffer", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				auto jh = result.get_json(true);
+				if (!obj->m_device) { return; }
+
+				auto names = obj->m_device->get_static_buffer_names();
+
+				for (auto& it : names)
+				{
+					auto sub = jh->push_var(it)->get_json(true);
+					sub->push_string(obj->m_device->get_static_buffer_desc(it), "description");
+					sub->push_string(obj->m_device->get_static_buffer_setup(it), "setup");
+					sub->push_int(obj->m_device->get_static_buffer_size(it), "size");
+
+					switch (obj->m_device->get_static_buffer_type(it))
+					{
+					case NETWORK_BUFFER_STATIC_DATA:
+						sub->push_string("data", "type");
+						break;
+					case NETWORK_BUFFER_STATIC_LEDS_1CH:
+						sub->push_string("led_1ch", "type");
+						break;
+					case NETWORK_BUFFER_STATIC_LEDS_3CH:
+						sub->push_string("led_3ch", "type");
+						break;
+					case NETWORK_BUFFER_STATIC_LEDS_4CH:
+						sub->push_string("led_4ch", "type");
+						break;
+					default:
+						break;
+					}
+				}
+
+			}, 0, true, false, "()");
+
+
 		scriptFunction("still_valid", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
 			{
 				if (!obj->m_device) { result.initInt(0);  return; }
@@ -752,9 +822,205 @@ public:
 			else
 				blk->runtimeError("NET", "Cannot get ticket id.");
 
-			result.returnInt(send_id != INVALID_TICKETID);
+			result.returnInt(1);
 
 		}, 3, true, false, "(cmd, data, timeout)");
+
+		//More aggressive function than get
+		scriptFunction("fetch", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				result.initInt(0);
+
+				if (!obj->m_device) { return; }
+
+				if (params.size() < 1)
+					return;
+				if (params[0]->Type != SHZVAR_STRING)
+					return;
+
+				auto dtype = params.size() >= 2 ? params[1]->Type : SHZVAR_VOID;
+
+				const char* cmd = params[0]->VarPtr.strptr->c_str();
+
+				auto param_data = &result;
+
+				shzptr blk_ref(blk);
+
+				auto respond_cb = [blk_ref, param_data](byte* data, size_t size, shznet_pkt_dataformat fmt, bool success)
+					{
+						if (!blk_ref.get())
+							return;
+
+						SCRIPTAUTOLOCK();
+
+						if (!blk_ref.get())
+							return;
+
+						param_data->initInt(0);
+						if (success)
+						{
+							data_to_var(fmt, data, size, param_data);
+						}
+
+						blk_ref->resume();
+					};
+
+				uint64_t timeout = params.size() >= 3 ? params[2]->get_int() : 1000 * 60 * 10;
+
+				switch (dtype)
+				{
+				case SHZVAR_INT:
+				{
+					int64_t v = params[1]->get_int();
+					(obj->m_device->send_fetch(cmd,
+						(byte*)&v,
+						sizeof(int64_t),
+						SHZNET_PKT_FMT_INT64, respond_cb, timeout));
+					break;
+				}
+				case SHZVAR_FLOAT:
+				{
+					double v = params[1]->get_float();
+					(obj->m_device->send_fetch(cmd,
+						(byte*)&v,
+						sizeof(double),
+						SHZNET_PKT_FMT_FLOAT64, respond_cb, timeout));
+					break;
+				}
+				case SHZVAR_STRING:
+					(obj->m_device->send_fetch(cmd,
+						(byte*)params[1]->VarPtr.strptr->c_str(),
+						params[1]->VarPtr.strptr->length() + 1,
+						SHZNET_PKT_FMT_STRING, respond_cb, timeout));
+					break;
+					/*case SHZVAR_shzobject:
+					{
+						SOH_Instance()->
+						auto obj = SOH_Instance()->get_object(params[1]);
+						if(obj)
+							obj->
+						break;
+					}*/
+				case SHZVAR_JSON:
+				{
+					if (obj->m_device->_has_shizoscript_json)
+					{
+						auto jh = params[1]->get_json();
+						static uchar_array_s _tmp;
+						_tmp.clear();
+						jh->to_data(_tmp);
+
+						(obj->m_device->send_fetch(cmd,
+							(byte*)_tmp.data(),
+							_tmp.size(),
+							SHZNET_PKT_FMT_JSON, respond_cb, timeout));
+						break;
+					}
+					else
+					{
+						auto jh = params[1]->get_json();
+						auto kvw = shznet_kv_writer();
+						for (auto it : jh->jsons)
+						{
+							if (!it->key.allocated() || it->key.get().empty())
+							{
+								SLH_Instance()->logerror("Cannot send empty keys (lists)!");
+								continue;
+							}
+
+							if (it->is_int())
+								kvw.add_int64(it->key.get().c_str(), it->get_int());
+							else if (it->is_float())
+								kvw.add_float64(it->key.get().c_str(), it->get_float());
+							else if (it->is_string())
+								kvw.add_string(it->key.get().c_str(), it->get_string_cptr());
+							else if (it->is_data())
+								kvw.add_data(it->key.get().c_str(), it->get_uchar_array()->data(), it->get_uchar_array()->size());
+							//TODO: add json case, recursively shznet_kv_writer (sub objects not supported yet otherwise)
+						}
+						(obj->m_device->send_fetch(cmd,
+							(byte*)kvw.get_buffer().data(),
+							kvw.get_buffer().size(),
+							SHZNET_PKT_FMT_KEY_VALUE, respond_cb, timeout));
+						break;
+					}
+				}
+				case SHZVAR_CHAR_ARRAY:
+				case SHZVAR_UCHAR_ARRAY:
+					(obj->m_device->send_fetch(cmd,
+						(byte*)params[1]->get_uchar_array()->data(),
+						params[1]->get_uchar_array()->size(),
+						SHZNET_PKT_FMT_DATA, respond_cb, timeout));
+					break;
+				case SHZVAR_FLOAT_ARRAY:
+					(obj->m_device->send_fetch(cmd,
+						(byte*)params[1]->getFloatset()->data(),
+						params[1]->getFloatset()->size() * sizeof(float),
+						SHZNET_PKT_FMT_FLOAT32_ARRAY, respond_cb, timeout));
+					break;
+				case SHZVAR_DOUBLE_ARRAY:
+					(obj->m_device->send_fetch(cmd,
+						(byte*)params[1]->getDoubleset()->data(),
+						params[1]->getFloatset()->size() * sizeof(double),
+						SHZNET_PKT_FMT_FLOAT64_ARRAY, respond_cb, timeout));
+					break;
+				case SHZVAR_INT_ARRAY:
+					(obj->m_device->send_fetch(cmd,
+						(byte*)params[1]->getIntset()->data(),
+						params[1]->getIntset()->size() * sizeof(int),
+						SHZNET_PKT_FMT_INT32_ARRAY, respond_cb, timeout));
+					break;
+				case SHZVAR_LONG_ARRAY:
+					(obj->m_device->send_fetch(cmd,
+						(byte*)params[1]->getBigintset()->data(),
+						params[1]->getBigintset()->size() * sizeof(long long),
+						SHZNET_PKT_FMT_INT64_ARRAY, respond_cb, timeout));
+					break;
+				case SHZVAR_VOID:
+					(obj->m_device->send_fetch(cmd,
+						0,
+						0,
+						SHZNET_PKT_FMT_DATA, respond_cb, timeout));
+					break;
+				default:
+					SLH_Instance()->logerror("invalid data type in get!");
+					break;
+				}
+
+				blk->suspend();
+
+				result.returnInt(1);
+
+			}, 3, true, false, "(cmd, data, timeout)");
+
+		scriptFunction("set_static_buffer_leds", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				if (params.size() < 3)
+					return;
+
+				if (!obj->m_device) { return; }
+
+				int universe = params[0]->get_int();
+				int start_adr = params[1]->get_int();
+				auto data_buffer = params[2]->is_int() ? 0 : params[2]->get_uchar_array();
+
+				if (data_buffer)
+				{
+					size_t data_offset = params.size() >= 4 ? params[3]->get_int() : 0;
+					size_t data_size = params.size() >= 5 ? std::min((size_t)params[4]->get_int(), data_buffer->size() - data_offset) : data_buffer->size() - data_offset;
+
+					obj->m_device->set_static_buffer_leds(universe, start_adr, data_buffer->data(), data_size, data_offset, params.size() >= 6 ? params[5]->get_int() : 1);
+				}
+				else
+				{
+					size_t data_offset = params.size() >= 4 ? params[3]->get_int() : 0;
+					size_t data_size = params.size() >= 5 ? params[4]->get_int() : 0;
+
+
+					//obj->m_device->set_artnet_buffer(universe, start_adr, (byte)params[2]->get_int(), data_size, data_offset, wrap_leds);
+				}
+
+			}, 6, true, false, "(universe, start_index, buffer, buffer_offset, buffer_size, input_channels)");
 
 	}
 
@@ -1457,6 +1723,29 @@ public:
 		scriptFunction("get_artnet_devices", [](ShizoNetBase* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
 			{
 				result.get_json()->clear();
+
+				for (auto it : obj->m_artnet_devices)
+				{
+					auto nv = result.get_json()->push_var();
+
+					auto dev_object = new ShizoArtnetDevice(it.second);
+
+					dev_object->associateVar(nv, blk);
+				}
+			}, 0, true, false, "()");
+
+		scriptFunction("get_all_devices", [](ShizoNetBase* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				result.get_json()->clear();
+
+				for (auto it : obj->m_devices)
+				{
+					auto nv = result.get_json()->push_var();
+
+					auto dev_object = new ShizoNetDevice(it.second);
+
+					dev_object->associateVar(nv, blk);
+				}
 
 				for (auto it : obj->m_artnet_devices)
 				{

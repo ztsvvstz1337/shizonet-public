@@ -1022,6 +1022,12 @@ public:
 
 			}, 6, true, false, "(universe, start_index, buffer, buffer_offset, buffer_size, input_channels)");
 
+		scriptFunction("clear_static_buffer", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				if (!obj->m_device) return;
+				obj->m_device->clear_static_buffers(params.size() == 1 ? params[0]->get_int() : 1);
+			}, 1, true, false, "(set_dirty)");
+
 	}
 
 	void set_device(shznet_device_ptr dev)
@@ -1703,6 +1709,17 @@ public:
 				{
 					it.second->clear_artnet_buffer(params.size() == 1 ? params[0]->get_int() : 1);
 				}
+
+			}, 1, true, false, "(set_dirty)");
+
+		scriptFunction("clear_all_buffers", [](ShizoNetBase* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				for (auto it : obj->m_artnet_devices)
+				{
+					it.second->clear_artnet_buffer(params.size() == 1 ? params[0]->get_int() : 1);
+				}
+				for (auto it : obj->m_devices)
+					it.second->clear_static_buffers(params.size() == 1 ? params[0]->get_int() : 1);
 
 			}, 1, true, false, "(set_dirty)");
 

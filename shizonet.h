@@ -48,6 +48,9 @@ struct shznet_channel_buffer
         max_seq = 0;
         buffer.clear();
         data_index = 0;
+#ifdef ARDUINO
+        //buffer.shrink_to_fit();
+#endif
     }
     void reset_seq(shznet_ticketid new_id)
     {
@@ -56,6 +59,9 @@ struct shznet_channel_buffer
         max_seq = 0;
         data_index = 0;
         buffer.clear();
+#ifdef ARDUINO
+        //buffer.shrink_to_fit();
+#endif
     }
 
     void write_data(byte* data, size_t size)
@@ -126,6 +132,9 @@ struct shznet_endpoint_s
         sessionid = INVALID_SESSIONID;
 
         channels.clear();
+#ifdef ARDUINO
+        //channels.shrink_to_fit();
+#endif
 
         oob.reset();
 
@@ -159,6 +168,9 @@ struct shznet_stream_endpoint_s
     void reset()
     {
         channels.clear();
+#ifdef ARDUINO
+        //channels.shrink_to_fit();
+#endif
 
         timeout.reset();
 
@@ -378,11 +390,22 @@ public:
             m_order_check_flag = true;
         }
 
-        if (artnet_frame_due && artnet_frame_timer.check())
+        if (art_frame_callback)
         {
-            artnet_frame_due = 0;
-            if(art_sync_timer.check())
+            if (artnet_frame_timer.check())
+            {
+                if (artnet_frame_due)
+                {
+                    artnet_frame_due = 0;
+                    if (art_sync_timer.check())
+                        art_frame_callback(m_next_frame_recv_time + artnet_frame_timer.get_wait_time());
+                }
+            }
+            else if (art_sync_time > 16.f && (shznet_millis() - expected_art_sync_time) > art_sync_time * 1.2)
+            {
                 art_frame_callback(m_next_frame_recv_time + artnet_frame_timer.get_wait_time());
+                expected_art_sync_time = shznet_millis();
+            }
         }
 
         for(auto it = m_endpoints.begin(); it != m_endpoints.end();)
@@ -450,7 +473,7 @@ public:
             if (is_artnet)
             {
                 bool exit_loop = false;
-                if (art_dmx_callback || m_always_enable_artnet)
+                if (art_dmx_callback || art_frame_callback || m_always_enable_artnet)
                 {
                     exit_loop = handle_artnet(packet_ip, (byte*)packet_data, packet_len, packet_recv_time);
                 }
@@ -842,8 +865,17 @@ public:
         }
         else if (opcode == ART_SYNC)
         {
+            artnet_frame_due = false;
             art_sync_timer.reset();
-            if (art_frame_callback) art_frame_callback(0);
+
+            auto recv_delta = recv_time - expected_art_sync_time;
+
+            float new_time = std::min((uint64_t)100, recv_delta); //minimum of 100ms ~10FPS
+            expected_art_sync_time = recv_time;
+            art_sync_time = new_time * 0.01 + art_sync_time * 0.99;
+
+            if (art_frame_callback && recv_delta >= 15) art_frame_callback(0);
+
             return false;
         }
 
@@ -877,11 +909,7 @@ public:
         shznet_pkt_header header;
         uint32_t cmd;
     };
-#ifdef ARDUINO
-#define MAX_ASYNC_ORDER_BUFFERS 32
-#else
-#define MAX_ASYNC_ORDER_BUFFERS 1024
-#endif
+
     shznet_async_buffer<sizeof(shznet_order_buffer_data*), MAX_ASYNC_ORDER_BUFFERS, command_async_header> async_commands;
     void push_generic_to_main_thread(shznet_ip& ip, shznet_pkt* pkt, shznet_order_buffer* buffer)
     {
@@ -903,8 +931,8 @@ public:
 #ifndef ARDUINO
             std::this_thread::yield();
 #else
-            delay(1);
             Serial.println("async command overrun!");
+            delay(1);
 #endif
         }
         buffer->data = 0;
@@ -1457,6 +1485,8 @@ protected:
     std::function<void(uint16_t universe, uint16_t length, uint8_t sequence, uint8_t* data, shznet_ip remoteIP)> art_dmx_callback = 0;
     std::function<void(uint64_t)> art_frame_callback = 0;
     shznet_timer art_sync_timer = shznet_timer(1000 * 10);
+    uint64_t expected_art_sync_time;
+    float art_sync_time = 0.0;
 
     bool            artnet_frame_due = false;
     shznet_timer    artnet_frame_timer = shznet_timer(4);
@@ -1580,7 +1610,7 @@ class shznet_device
     {
         //One chunk size which holds a dirty flag is 256 bytes
         const int single_chunk_size = 256;
-        const int max_packet_payload = 1300;
+        const int max_packet_payload = 1164;
 
         network_buffer_static_type type;
         std::vector<byte> buffer;
@@ -1640,15 +1670,32 @@ class shznet_device
 
         void set_dirty(uint32_t offset, uint32_t size)
         {
-            uint32_t chunk_start = offset / single_chunk_size;
-            uint32_t chunk_count = size / single_chunk_size + 1;
+            if (!size)
+                return;
 
-            for (uint32_t i = chunk_start; i < chunk_start + chunk_count; i++)
+            uint32_t chunk_start = offset / single_chunk_size;
+            uint32_t chunk_count = ((offset - chunk_start*single_chunk_size) + (size-1)) / single_chunk_size + 1;
+
+            for (uint32_t i = chunk_start; i < std::min((uint32_t)buffer_parts_dirty.size(), chunk_start + chunk_count); i++)
             {
                 buffer_parts_dirty[i] = true;
             }
 
             buffer_dirty = true;
+        }
+
+        void clear(bool set_dirty)
+        {
+            if (buffer.size())
+            {
+                memset(buffer.data(), 0, buffer.size());
+                if (set_dirty)
+                {
+                    for (uint32_t i = 0; i < buffer_parts_dirty.size(); i++)
+                        buffer_parts_dirty[i] = true;
+                    buffer_dirty = true;
+                }
+            }
         }
 
         //HANDLING
@@ -1676,7 +1723,7 @@ class shznet_device
 
                 for (; chunk_end < buffer_parts_dirty.size(); chunk_end++, chunk_count++)
                 {
-                    if (!buffer_parts_dirty[chunk_start] || writer.get_buffer().size() + (chunk_count + 1) * single_chunk_size > max_packet_payload)
+                    if (!buffer_parts_dirty[chunk_end] || writer.get_buffer().size() + (chunk_count + 1) * single_chunk_size > max_packet_payload)
                         break;
                 }
 
@@ -1693,8 +1740,7 @@ class shznet_device
 
                 for (uint32_t i = chunk_start; i < chunk_end; i++)
                     buffer_parts_dirty[i] = false;
-
-                _chunk_index = chunk_end + 1;
+                _chunk_index = chunk_end;
             }
 
             return true;
@@ -2313,7 +2359,7 @@ public:
                 ordered_buffers.push(cmd_buf);
             else
                 unordered_buffers.push_back(cmd_buf);
-            update(-1);
+
             return cmd_buf->ticketid;
         }
 
@@ -2349,7 +2395,7 @@ public:
             ordered_buffers.push(cmd_buf);
         else
             unordered_buffers.push_back(cmd_buf);
-        update(-1);
+
         return cmd_buf->ticketid;
     }
 
@@ -2401,6 +2447,9 @@ public:
     bool check_packet_pacing(bool increase_pkt_counter = true)
     {
         auto send_group = m_current_send_group;
+
+        if (send_group < 0)
+            send_group = m_last_send_group;
 
         if (!max_packets_before_pacing)
         {
@@ -2625,11 +2674,13 @@ public:
 
             if (network_buffers_static_list.size() && send_group >= 0)
             {
+                if (send_group == 0 && network_buffer_current >= network_buffers_static_list.size())
+                    network_buffer_current = 0;
                 if (network_buffer_current < network_buffers_static_list.size())
                 {
                     network_buffer_send.clear();
 
-                    for (; network_buffer_current < network_buffers_static_list.size(); network_buffer_current++)
+                    for (; network_buffer_current < network_buffers_static_list.size();)
                     {
                         if (check_packet_pacing(false)) //just read counter
                             break;
@@ -2638,13 +2689,17 @@ public:
                         auto buf_hash = buf.name_hash;
 
                         if (buf.buffer.size() == 0 || !buf.buffer_dirty) //not yet allocated or changed, skip
+                        {
+                            network_buffer_current++;
                             continue;
-
+                        }
                         if (buf.next_chunk(network_buffer_send)) //if this returns true, we can just go to the next buffer and keep filling data in
+                        {
+                            network_buffer_current++;
                             continue;
+                        }
 
                         //next chunk didnt return true so we have to flush and send the buffer now
-                        //max single packet size: 1200
                         this->send_unreliable("SHZSET_STATIC_BUFFER", network_buffer_send.get_buffer().data(), network_buffer_send.get_buffer().size(), SHZNET_PKT_FMT_KEY_VALUE);
                         network_buffer_send.clear();
                         pps_counter++;
@@ -2662,8 +2717,6 @@ public:
                         check_packet_pacing();
                     }
                 }
-                else if (send_group == 0)
-                    network_buffer_current = 0;
             }
         }
 
@@ -2895,7 +2948,7 @@ public:
                 unordered_buffers.push_back(cmd_buf);
             else
                 response_buffers.push_back(cmd_buf);
-            update(-1);
+
             return cmd_buf->ticketid;
         }
 
@@ -2934,7 +2987,7 @@ public:
             unordered_buffers.push_back(cmd_buf);
         else
             response_buffers.push_back(cmd_buf);
-        update(-1);
+
         return cmd_buf->ticketid;
     }
 
@@ -2983,6 +3036,14 @@ public:
         {
             auto& nb = *nb_entry->second.get();
             set_static_buffer_leds(nb, start_adr, data_buffer, data_size, data_offset, input_channels);
+        }
+    }
+
+    void clear_static_buffers(bool set_dirty)
+    {
+        for (auto& it : network_buffers_static_list)
+        {
+            it->clear(set_dirty);
         }
     }
 
@@ -3078,7 +3139,7 @@ class shznet_artnet_device
         {
             universe_buffer = std::vector<byte>(512 * 17); //+1 just in case someone buffer overruns
             memset(universe_buffer.data(), 0, universe_buffer.size());
-            memset(dirty, 0, 16);
+            memset(dirty, 1, 16);
         }
     };
 
@@ -3495,7 +3556,7 @@ protected:
 
     bool            send_artnet_sync = true;
     int             artnet_send_group = 0;
-    shznet_timer    artnet_delay = shznet_timer(2); //target to send 16 universes at 60 FPS with 4 universes every 2 milliseconds
+    shznet_timer    artnet_delay = shznet_timer(4); //target to send 16 universes at 60 FPS with 4 universes every 2 milliseconds
 
     bool            m_shizonet_enabled = true;
 
@@ -3503,6 +3564,8 @@ protected:
                     //would be to obtain all IP addresses from all interfaces
                     //And send broadcast messages to all of that addresses from all interfaces
     bool            m_poll_broadcast_subnet_switch = false;
+
+    bool is_client_only = false;
 
 public:
 
@@ -3566,22 +3629,28 @@ public:
                         continue;
                     send_shz_poll(dev_ptr->get_address());
                     NETPRNT_FMT("testing device %s.\n", dev_ptr->get_name().c_str());
+                    
+                    uint32_t receive_cmd_defs = !is_client_only;
+                    
                     auto tid = dev_ptr->send_get(
                         SHZNET_TEST_CMD,
-                        0,0,
-                        SHZNET_PKT_FMT_DATA,
+                        (byte*)&receive_cmd_defs, sizeof(receive_cmd_defs),
+                        SHZNET_PKT_FMT_INT32,
                         [this, dev_ptr](byte* data, size_t size, shznet_pkt_dataformat fmt, bool success) {
                             if (!success || !size) {
                                 //disconnect_device(dev_ptr->get_mac(), "init connection failed.");
                                 NETPRNT("init connection failed.");
                                 if (dev_ptr->_init_connection_attempts < 3)
                                 {
+                                    NETPRNT("retrying...");
                                     check_device_connections.push_back(dev_ptr);
                                     dev_ptr->_init_connection_attempts++;
                                 }
                                 else
+                                {
+                                    NETPRNT("disconnecting device...");
                                     disconnect_device(dev_ptr->get_mac(), "init connection failed.");
-
+                                }
                                 return;
                             }
 
@@ -3802,15 +3871,16 @@ public:
             }
         }
       
-        auto send_grp = artnet_send_group >= 0 ? artnet_send_group : 3;
+        int start_send_grp = artnet_send_group;
+        int end_send_grp = start_send_grp;
 
-        if (send_grp >= 0)
+        if (artnet_send_group >= 0)
         {
-            if (artnet_delay.update())
-            {
+            while (artnet_delay.update_period(true))
+            {              
                 for (auto it : m_artnet_devices)
                 {
-                    it.second->update(send_grp);
+                    it.second->update(artnet_send_group);
                 }
 
                 artnet_send_group++;
@@ -3818,14 +3888,29 @@ public:
                 if (artnet_send_group >= 4)
                 {
                     artnet_send_group = -1;
+                    artnet_delay.update_period(false);
+                    break;
                 }
+
+                end_send_grp++;
             }
         }
 
         if (m_shizonet_enabled)
-        {
-            for (auto& it : m_devices)
-                it.second->update(send_grp);
+        {          
+            if (start_send_grp >= 0)
+            {
+                for (auto& it : m_devices)
+                {
+                    for (int i = start_send_grp; i <= end_send_grp; i++)
+                        it.second->update(i);
+                }
+            }
+            else
+            {
+                for (auto& it : m_devices)
+                    it.second->update(-1);
+            }
 
             for (auto& it : m_devices_pending)
             {
@@ -3835,16 +3920,18 @@ public:
         }
     }
 
+    shznet_timer artnet_sync_fps_debug;
     void artnet_sync_now()
     {
         if (artnet_send_group != -1)
         {
+#ifdef _WIN32
+           //printf("ARTNET OVERRUN! %i %i\n", artnet_send_group, (int)artnet_sync_fps_debug.delay_reset());
+#endif
             for (int i = artnet_send_group; i < 4; i++)
             {
                 for (auto &it : m_artnet_devices)
-                {
                     it.second->update(i);
-                }
 
                 for (auto& it : m_devices)
                     it.second->update(i);
@@ -4071,6 +4158,9 @@ public:
 
     void handle_artnet_reply(shznet_ip& adr, artnet_poll_reply* poll_reply) override
     {
+        if (is_client_only)
+            return;
+
         if (memcmp(poll_reply->mac, "\x00\x00\x00\x00\x00\x00", 6) == 0)
         {
             memcpy(poll_reply->mac, adr.ip, 4);
@@ -4118,6 +4208,9 @@ public:
 
     void send_art_poll()
     {
+        if (is_client_only)
+            return;
+
         if (!m_poll_broadcast_subnet_switch)
         {
             shznet_ip adr((short)ART_NET_PORT);
@@ -4152,16 +4245,23 @@ public:
 
     void send_art_poll(shznet_ip& adr)
     {
+        if (is_client_only)
+            return;
         m_udp.send_packet_artnet(adr, (uint8_t*)&art_poll, sizeof(artnet_poll));
     }
 
     void send_art_sync(shznet_ip& adr)
     {
+        if (is_client_only)
+            return;
         m_udp.send_packet_artnet(adr, (uint8_t*)&art_sync, sizeof(artnet_sync));
     }
 
     void send_shz_poll()
     {
+        if (is_client_only)
+            return;
+
         m_send_buffer.packet_begin(SHZNET_PKT_AUTH_BEACON, get_udp().local_adr().mac, shznet_broadcast_mac);
 
         uint32_t pkt_size = m_send_buffer.packet_end();
@@ -4488,54 +4588,62 @@ public:
                 kvw.add_int32("has_json", _has_shizoscript_json);
                 kvw.add_int32("pacing", SHZNET_PACKET_PACING_COUNT);
 
-                shznet_kv_writer kvw_sub;
+                uint32_t send_cmd_defs = 1;
 
-                for (auto& it : m_command_names)
+                if (responder->size() == sizeof(send_cmd_defs))
+                    send_cmd_defs = *(uint32_t*)responder->data();
+
+                if (send_cmd_defs)
                 {
-                    shznet_command_defs def;
-                    memset(&def, 0, sizeof(def));
-                    def.hash = it.first;
-                    def.type = 0;
-                    kvw_sub.add_data(it.second.c_str(), (byte*)&def, sizeof(def));
+                    shznet_kv_writer kvw_sub;
+
+                    for (auto& it : m_command_names)
+                    {
+                        shznet_command_defs def;
+                        memset(&def, 0, sizeof(def));
+                        def.hash = it.first;
+                        def.type = 0;
+                        kvw_sub.add_data(it.second.c_str(), (byte*)&def, sizeof(def));
+                    }
+                    for (auto& it : m_response_command_names)
+                    {
+                        shznet_command_defs def;
+                        memset(&def, 0, sizeof(def));
+                        def.hash = it.first;
+                        def.type = 1;
+                        kvw_sub.add_data(it.second.c_str(), (byte*)&def, sizeof(def));
+                    }
+                    kvw.add_kv("commands", kvw_sub);
+
+
+                    kvw_sub.clear();
+                    for (auto& it : m_network_buffers_static)
+                    {
+                        shznet_buffer_defs bdef;
+                        memset(&bdef, 0, sizeof(bdef));
+                        bdef.hash = it.first;
+                        bdef.size = it.second.size;
+                        bdef.type = (uint32_t)it.second.type;
+                        kvw_sub.add_data(m_network_buffers_static_names[it.first].c_str(), (byte*)&bdef, sizeof(bdef));
+                    }
+                    kvw.add_kv("static_buffers", kvw_sub);
+
+
+                    kvw_sub.clear();
+                    for (auto& it : m_network_buffers_static)
+                    {
+                        kvw_sub.add_string(m_network_buffers_static_names[it.first].c_str(), it.second.description.c_str());
+                    }
+                    kvw.add_kv("static_buffers_desc", kvw_sub);
+
+
+                    kvw_sub.clear();
+                    for (auto& it : m_network_buffers_static)
+                    {
+                        kvw_sub.add_string(m_network_buffers_static_names[it.first].c_str(), it.second.setup.c_str());
+                    }
+                    kvw.add_kv("static_buffers_setup", kvw_sub);
                 }
-                for (auto& it : m_response_command_names)
-                {
-                    shznet_command_defs def;
-                    memset(&def, 0, sizeof(def));
-                    def.hash = it.first;
-                    def.type = 1;
-                    kvw_sub.add_data(it.second.c_str(), (byte*)&def, sizeof(def));
-                }
-                kvw.add_kv("commands", kvw_sub);
-
-
-                kvw_sub.clear();
-                for (auto& it : m_network_buffers_static)
-                {
-                    shznet_buffer_defs bdef;
-                    memset(&bdef, 0, sizeof(bdef));
-                    bdef.hash = it.first;
-                    bdef.size = it.second.size;
-                    bdef.type = (uint32_t)it.second.type;
-                    kvw_sub.add_data(m_network_buffers_static_names[it.first].c_str(), (byte*)&bdef, sizeof(bdef));
-                }
-                kvw.add_kv("static_buffers", kvw_sub);
-
-
-                kvw_sub.clear();
-                for (auto& it : m_network_buffers_static)
-                {
-                    kvw_sub.add_string(m_network_buffers_static_names[it.first].c_str(), it.second.description.c_str());
-                }
-                kvw.add_kv("static_buffers_desc", kvw_sub);
-
-
-                kvw_sub.clear();
-                for (auto& it : m_network_buffers_static)
-                {
-                    kvw_sub.add_string(m_network_buffers_static_names[it.first].c_str(), it.second.setup.c_str());
-                }
-                kvw.add_kv("static_buffers_setup", kvw_sub);
 
                 responder->respond(kvw);
             });
@@ -4718,7 +4826,8 @@ public:
                 else if (responder->data() && responder->size() == sizeof(uint64_t))
                     size = *(uint64_t*)responder->data();
 
-
+                Serial.print("Free heap size: ");
+                Serial.println(esp_get_free_heap_size());
 
                 Serial.print("OTA begin with size: ");
                 Serial.println(size);
@@ -4732,6 +4841,19 @@ public:
                 }
 
                 Serial.println("OTA open successful.");
+
+                Serial.print("Free heap size: ");
+                Serial.println(esp_get_free_heap_size());
+
+                esp_task_wdt_config_t config = {
+                    .timeout_ms = 30000, // 15 secs in milliseconds
+                    .idle_core_mask = (1 << xPortGetCoreID()), // Watch only the current core
+                    .trigger_panic = true // Enable panic so ESP32 restarts on timeout
+                };
+
+                esp_task_wdt_init(&config);
+                esp_task_wdt_add(0);
+                esp_task_wdt_reset();
 
                 kvw.add_int32("success", 1);
 
@@ -4941,7 +5063,7 @@ public:
 
     shznet_client() : shznet_base()
     {
-        
+        is_client_only = true;
     }
 
     virtual ~shznet_client() { m_udp.invalidate_threads(); }

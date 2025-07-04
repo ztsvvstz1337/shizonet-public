@@ -1,4 +1,4 @@
-
+﻿
 #include "shizonet.h"
 
 void* shznet_malloc(size_t size)

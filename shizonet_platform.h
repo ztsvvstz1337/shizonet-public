@@ -16,14 +16,16 @@
 
 #ifdef ARDUINO
 #define SHZNET_PKT_MAX_QUEUES 0
-#define SHZNET_PKT_MAX_ASYNC 2
-#define SHZNET_PKT_MAX_ASYNC_DIAG 2
+#define SHZNET_PKT_MAX_ASYNC 4
+#define SHZNET_PKT_MAX_ASYNC_DIAG 4
 #define SHZNET_MAX_STREAMS 8
+#define MAX_ASYNC_ORDER_BUFFERS 4
 #else
 #define SHZNET_PKT_MAX_QUEUES 0
 #define SHZNET_PKT_MAX_ASYNC 512
 #define SHZNET_PKT_MAX_ASYNC_DIAG SHZNET_PKT_MAX_ASYNC
 #define SHZNET_MAX_STREAMS 256
+#define MAX_ASYNC_ORDER_BUFFERS 1024
 #endif
 
 #ifndef _WIN32
@@ -51,8 +53,8 @@ namespace std
 #include <Arduino.h>
 #ifdef SHIZONET_DEBUG
 #define NETPRNT(str) Serial.println(str)
-#define NETPRNT_FMT(str,...) Serial.printf(str, __VA_ARGS__)
-#define NETPRNT_ERR(str) Serial.printf(str, __VA_ARGS__)
+#define NETPRNT_FMT(str,...) Serial.print(str)
+#define NETPRNT_ERR(str) Serial.println(str)
 #else
 #define NETPRNT(str)
 #define NETPRNT_FMT(str,...)
@@ -997,6 +999,32 @@ public:
         return false;
     }
 
+    bool update_period(bool get_all_updates = false)
+    {
+        if (wait_time == 0)
+            return false;
+
+        uint64_t current_time = shznet_millis();
+
+        if (current_time >= start_time + wait_time)
+        {
+            if (get_all_updates)
+            {
+                if (start_time == 0)
+                    start_time = current_time;
+                start_time += wait_time;
+            }
+            else
+            {
+                uint64_t delta = current_time - (start_time + wait_time);
+                start_time = current_time - delta;
+            }
+            return true;
+        }
+
+        return false;
+    }
+
     bool timeout() //same as update, but resets the timer everytime it is called
     {
         if (wait_time == 0)
@@ -1156,15 +1184,21 @@ public:
     {
         if (!object)
             return;
+        m_in_use--;
         //TODO implement upper limits for various platforms....
+        //Or dont use this on arduino at all??
 #ifdef ARDUINO
-        if (object->total_size() > 1024 * 10 || m_garbage.size() > 16) //10kb
+        delete object;
+        return;
+#endif
+
+#ifdef ARDUINO
+        if (object->total_size() > 16 || m_garbage.size() > 16) //10kb
         {
             delete object;
             return;
         }
 #endif
-        m_in_use--;
         m_garbage.push_back(object);
     }
 
@@ -1207,16 +1241,31 @@ public:
     {
         if (!object)
             return;
+        //TODO implement upper limits for various platforms....
+        //Or dont use this on arduino at all??
+#ifdef ARDUINO
+        delete object;
+        return;
+#endif
+
+
 #if defined(__XTENSA__) || !defined(ARDUINO)
         std::unique_lock<std::mutex> _grd{ m_lock };
 #endif
-        //TODO implement upper limits for various platforms....
+        
+#ifdef ARDUINO
+        if (m_garbage.size() > 4) //10kb
+        {
+            delete object;
+            return;
+        }
+#endif
         m_garbage.push_back(object);
     }
 
     T* get()
     {
-#if defined(__XTENSA__) || !defined(ARDUINO)
+#if !defined(ARDUINO)
         std::unique_lock<std::mutex> _grd{ m_lock };
 #endif
         if (m_garbage.size())
@@ -2231,7 +2280,7 @@ public:
                     header.recv_time = shznet_millis();
                     if (!m_asyncbuffer.write(packet.data(), packet.length(), &header))
                     {
-                        Serial.println("packet overflow!");
+                        //Serial.println("packet overflow!");
                         missed_packets = true;
                     }
 
@@ -2299,7 +2348,7 @@ public:
             */
             if (res != len) 
             { 
-                Serial.printf("sendto failed (%i)! %s\n", len, info.str().c_str()); 
+                Serial.print("sendto failed!\n"); 
                 vTaskDelay(1);
             }
 

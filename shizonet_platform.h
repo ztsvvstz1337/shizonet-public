@@ -16,10 +16,10 @@
 
 #ifdef ARDUINO
 #define SHZNET_PKT_MAX_QUEUES 0
-#define SHZNET_PKT_MAX_ASYNC 4
+#define SHZNET_PKT_MAX_ASYNC 8
 #define SHZNET_PKT_MAX_ASYNC_DIAG 4
 #define SHZNET_MAX_STREAMS 8
-#define MAX_ASYNC_ORDER_BUFFERS 4
+#define MAX_ASYNC_ORDER_BUFFERS 8
 #else
 #define SHZNET_PKT_MAX_QUEUES 0
 #define SHZNET_PKT_MAX_ASYNC 512
@@ -384,6 +384,7 @@ enum shznet_pkt_flags : byte
     SHZNET_PKT_FLAGS_NONE = 0,
     SHZNET_PKT_FLAGS_UNRELIABLE = 1,
     SHZNET_PKT_FLAGS_RECEIVER_ONLY = 2,
+    SHZNET_PKT_FLAGS_STREAM_DATA = 4,
 };
 enum shznet_pkt_dataformat : byte
 {
@@ -458,7 +459,7 @@ struct shznet_pkt
             return false;
 
         //no checksum check for streams, handle that later to save ressources
-        if (!force_checksum && header.type == SHZNET_PKT_STREAM)
+        if (!force_checksum && (header.type == SHZNET_PKT_STREAM || header.flags & SHZNET_PKT_FLAGS_STREAM_DATA))
             return true;
 
         uint32_t real_chksum = header.chksum;
@@ -544,6 +545,11 @@ struct shznet_pkt
     void packet_set_unreliable()
     {
         header.flags |= SHZNET_PKT_FLAGS_UNRELIABLE;
+    }
+
+    void packet_set_stream_flag() //this means if the endpoint on the other device doesnt exist, it shouldnt send a RESET_BUFFERS_REQ
+    {
+        header.flags |= SHZNET_PKT_FLAGS_STREAM_DATA;
     }
 
     void packet_set_format(shznet_pkt_dataformat fmt)
@@ -680,6 +686,11 @@ struct shznet_pkt_big
     void packet_set_unreliable()
     {
         header.flags |= SHZNET_PKT_FLAGS_UNRELIABLE;
+    }
+
+    void packet_set_stream_flag() //this means if the endpoint on the other device doesnt exist, it shouldnt send a RESET_BUFFERS_REQ
+    {
+        header.flags |= SHZNET_PKT_FLAGS_STREAM_DATA;
     }
 
     void packet_set_format(shznet_pkt_dataformat fmt)
@@ -829,7 +840,7 @@ struct shznet_pkt_diagnostic
 enum shznet_pkt_diagnostic_request_type : uint32_t
 {
     SHZNET_PKT_DIAG_REQ_DEFAULT,
-    SHZNET_PKT_DIAG_REQ_RESET_BUFFERS, //other endpoint is still sending buffered data from a prev session, tell it to stop. 
+    //SHZNET_PKT_DIAG_REQ_RESET_BUFFERS, //other endpoint is still sending buffered data from a prev session, tell it to stop. 
 };
 
 struct shznet_pkt_diagnostic_request
@@ -1185,15 +1196,9 @@ public:
         if (!object)
             return;
         m_in_use--;
-        //TODO implement upper limits for various platforms....
-        //Or dont use this on arduino at all??
-#ifdef ARDUINO
-        delete object;
-        return;
-#endif
 
 #ifdef ARDUINO
-        if (object->total_size() > 16 || m_garbage.size() > 16) //10kb
+        if (object->total_size() > 64 || m_garbage.size() > 16)
         {
             delete object;
             return;
@@ -1241,20 +1246,12 @@ public:
     {
         if (!object)
             return;
-        //TODO implement upper limits for various platforms....
-        //Or dont use this on arduino at all??
-#ifdef ARDUINO
-        delete object;
-        return;
-#endif
-
-
 #if defined(__XTENSA__) || !defined(ARDUINO)
         std::unique_lock<std::mutex> _grd{ m_lock };
 #endif
         
 #ifdef ARDUINO
-        if (m_garbage.size() > 4) //10kb
+        if (m_garbage.size() > 8)
         {
             delete object;
             return;
@@ -1696,11 +1693,12 @@ protected:
 
     void handle_diagnostics_request(shznet_ip& adr, shznet_pkt_diagnostic_request* req)
     {
-        if (req->type == SHZNET_PKT_DIAG_REQ_RESET_BUFFERS)
+        /*if (req->type == SHZNET_PKT_DIAG_REQ_RESET_BUFFERS)
         {
             NETPRNT("todo: clear sendbuffers for IP here");
             return;
         }
+        */
 
         uint64_t timestamp_start = shznet_millis();
 

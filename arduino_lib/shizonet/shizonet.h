@@ -10,11 +10,13 @@
 extern char* ota_class;
 extern char* ota_subclass;
 #define SHZNET_MAX_RECV (1024 * 10) //10kb
-#define SHZNET_MAX_RECV_BUFFERS (3) //3 Buffers (~30kb)
+#define SHZNET_MAX_RECV_BUFFERS (4) //3 Buffers (~30kb)
 #define SHZNET_MAX_RECV_OOB (1024 * 10) //10kb OOB data 
-#define SHZNET_PACKET_PACING_COUNT 5 //Send X packets at once and then wait for the microcontroller to process them before sending more
+#define SHZNET_PACKET_PACING_COUNT 2 //Send X packets at once and then wait for the microcontroller to process them before sending more
                                     //This is based on the arduino pacing code which sends packets every 4 ms (to get 60 FPS at 16ms total window, sending 4*4 universes over that window)
                                     //You can send a total of SHZNET_PACKET_PACING_COUNT * 4 per frame before it will start to lag (sadly RECVMSGBOXSIZE in ESP IDF is pretty low...)
+                                    //This value has been carefully trial and error'd, trying to get more data through the ESP by sending more packets
+                                    //is generally a bad idea, the only thing you can do is increase the payload on each packet to get more data thru
 #else
 #define SHZNET_MAX_RECV (-1)
 #define SHZNET_MAX_RECV_BUFFERS (-1)
@@ -581,6 +583,10 @@ public:
         auto endpoint = m_endpoints.find(target_mac);
         if (endpoint == m_endpoints.end())
         {
+            /*
+            if (pkt->header.flags & SHZNET_PKT_FLAGS_STREAM_DATA)
+                return;
+
             NETPRNT("oob packet from unknown origin.");
 #ifdef _WIN32
             NETPRNT(adr.str().c_str());
@@ -589,6 +595,7 @@ public:
             m_send_diag.type = SHZNET_PKT_DIAG_REQ_RESET_BUFFERS;
             m_send_diag.make_checksum();
             m_udp.send_buffered_prio(adr, (byte*)&m_send_diag, sizeof(m_send_diag));
+            */
             return;
         }
 
@@ -1789,6 +1796,7 @@ class shznet_device
     std::vector<std::shared_ptr<network_buffer_static_s>>                       network_buffers_static_list;
     std::vector<std::shared_ptr<network_buffer_static_s>>                       network_buffers_static_list_leds;
     std::vector<std::shared_ptr<network_buffer_static_s>>                       network_buffers_static_list_data;
+    uint64_t                                                                    network_buffers_static_sendindex = 0;
 
     shznet_kv_writer network_buffer_send;
     uint32_t network_buffer_current = 0;
@@ -1842,6 +1850,10 @@ protected:
     float current_pkts_per_loop = 0.0;
 
     int m_ping = 1;
+
+    //Static buffer diags
+    uint64_t static_buffers_sendindex = 0;
+    shznet_timer static_buffers_diag_timer = shznet_timer(500);
  
     friend class shznet_base_impl;
     friend class shznet_base;
@@ -2272,7 +2284,7 @@ public:
     }
 
 
-    bool send_unreliable(const char* cmd, byte* data, size_t size, shznet_pkt_dataformat fmt = SHZNET_PKT_FMT_DATA)
+    bool send_unreliable(const char* cmd, byte* data, size_t size, shznet_pkt_dataformat fmt = SHZNET_PKT_FMT_DATA, bool is_stream = false)
     {
         if (!size || !data) return 1;
         if (!base) return 0;
@@ -2291,6 +2303,7 @@ public:
             buf.packet_set_cmd((char*)cmd);
             buf.packet_set_data(data, size);
             buf.packet_set_unreliable();
+            if (is_stream) buf.packet_set_stream_flag();
             buf.packet_set_format(fmt);
             auto total_size = buf.packet_end();
             return sendto((byte*)&buf, total_size);
@@ -2308,6 +2321,7 @@ public:
 
         buf.packet_begin(SHZNET_PKT_OOB, get_local_mac(), get_mac(), get_new_ticketid(), get_sessionid());
         buf.packet_set_unreliable();
+        if (is_stream) buf.packet_set_stream_flag();
         buf.packet_set_format(fmt);
         buf.packet_set_cmd((char*)cmd);
 
@@ -2679,6 +2693,8 @@ public:
                 if (network_buffer_current < network_buffers_static_list.size())
                 {
                     network_buffer_send.clear();
+                    network_buffer_send.add_int64("idx", network_buffers_static_sendindex);
+                    size_t network_buffer_size_low = network_buffer_send.get_buffer().size();
 
                     for (; network_buffer_current < network_buffers_static_list.size();)
                     {
@@ -2700,17 +2716,22 @@ public:
                         }
 
                         //next chunk didnt return true so we have to flush and send the buffer now
-                        this->send_unreliable("SHZSET_STATIC_BUFFER", network_buffer_send.get_buffer().data(), network_buffer_send.get_buffer().size(), SHZNET_PKT_FMT_KEY_VALUE);
+                        this->send_unreliable("SHZSET_STATIC_BUFFER", network_buffer_send.get_buffer().data(), network_buffer_send.get_buffer().size(), SHZNET_PKT_FMT_KEY_VALUE, true);
+                        network_buffers_static_sendindex++;
+
                         network_buffer_send.clear();
+                        network_buffer_send.add_int64("idx", network_buffers_static_sendindex);
+                        network_buffer_size_low = network_buffer_send.get_buffer().size();
                         pps_counter++;
                         bps_counter += network_buffer_send.get_buffer().size();
                         current_pkts_per_loop += 1.f;
                         check_packet_pacing(); //now increase counter
                     }
 
-                    if (network_buffer_send.get_buffer().size())
+                    if (network_buffer_send.get_buffer().size() > network_buffer_size_low)
                     { 
-                        this->send_unreliable("SHZSET_STATIC_BUFFER", network_buffer_send.get_buffer().data(), network_buffer_send.get_buffer().size(), SHZNET_PKT_FMT_KEY_VALUE);
+                        this->send_unreliable("SHZSET_STATIC_BUFFER", network_buffer_send.get_buffer().data(), network_buffer_send.get_buffer().size(), SHZNET_PKT_FMT_KEY_VALUE, true);
+                        network_buffers_static_sendindex++;
                         pps_counter++;
                         bps_counter += network_buffer_send.get_buffer().size();
                         current_pkts_per_loop += 1.f;
@@ -3515,6 +3536,7 @@ protected:
     shznet_timer check_device_timer;
     std::vector<shznet_device_ptr> check_device_connections;
     std::vector<shznet_device_ptr> finalize_device_connections;
+
     void on_device_connect_internal(shznet_device_ptr dev_info)
     {
         dev_info->was_connected = false;
@@ -3930,6 +3952,7 @@ public:
 #endif
             for (int i = artnet_send_group; i < 4; i++)
             {
+
                 for (auto &it : m_artnet_devices)
                     it.second->update(i);
 
@@ -4766,6 +4789,15 @@ public:
             {
                 shznet_kv_reader reader(data, size);
             
+                if (!reader.read())
+                    return;
+
+                if (reader.get_fmt() != SHZNET_PKT_FMT_INT64)
+                    return;
+
+                //First item is the send index
+                uint64_t send_index = reader.get_value_type<uint64_t>();
+
                 while (reader.read())
                 {
                     //name_hash, start_chunk, data
@@ -4784,15 +4816,59 @@ public:
                     if (nb == m_network_buffers_static.end())
                         break;
 
-                    auto nbs = nb->second;
+                    auto &nbs = nb->second;
 
                     if (start_chunk * 256 + payload_size <= nbs.size)
                     {
                         memcpy(&nbs.data[start_chunk * 256], payload, payload_size);
                     }
+
+                    auto dev = find_device(hdr.macid_source).get();
+                    if (dev)
+                    {
+                        if (send_index > dev->static_buffers_sendindex)
+                        {
+                            if (send_index != dev->static_buffers_sendindex + 1 && dev->static_buffers_diag_timer.update())
+                            {
+                                //Notify device that we are loosing packets
+                                uint32_t missing_pkt_count = (send_index - dev->static_buffers_sendindex) - 1;
+                                kvw.clear();
+                                kvw.add_int32("missing", missing_pkt_count);
+                                dev->send_unreliable("SHZDIAG_STATIC_BUFFER", kvw.get_buffer().data(), kvw.get_buffer().size(), SHZNET_PKT_FMT_INT32);
+                            }
+                        }
+
+                        dev->static_buffers_sendindex = send_index;
+                    }
                 }
             });
         
+        add_command("SHZDIAG_STATIC_BUFFER", [this](shznet_ip& ip, byte* data, size_t size, shznet_pkt_header& hdr)
+            {
+                shznet_kv_reader reader(data, size);
+
+                if (!reader.read())
+                    return;
+
+                if (reader.get_fmt() != SHZNET_PKT_FMT_INT32)
+                    return;
+
+                uint64_t missing_pkts_count = reader.get_value_type<uint32_t>();
+
+                auto dev = find_device(hdr.macid_source);
+                if (dev)
+                {
+                    std::string msg = "Device " + dev->get_name() + " (" + dev->get_mac().str() + ") lost " + std::to_string(missing_pkts_count) + " pkts.\n";
+#ifdef ARDUINO
+                    Serial.println(msg.c_str());
+#else
+                    printf(msg.c_str());
+#endif
+                }
+                
+            });
+
+
 #ifdef ESP32_OTA
         add_command_respond("ESP32_OTA_START", [this](std::shared_ptr<shznet_responder> responder)
             {

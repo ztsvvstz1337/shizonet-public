@@ -1,3 +1,12 @@
+
+/*
+ * Copyright (c) 2018–Now Erik Mackrodt. All rights reserved.
+ *
+ * This file is part of Shizotech™ software, developed and maintained by Erik Mackrodt.
+ *
+ * For inquiries, please visit: https://shizotech.com
+ */
+
 #pragma once
 
 #include "shizonet_platform.h"
@@ -2239,6 +2248,8 @@ public:
         return tid;
     }
 
+    uint32_t get_static_buffer_count() { return network_buffers_static_list.size(); }
+    
     std::vector<std::string> get_static_buffer_names()
     {
         std::vector<std::string> result;
@@ -2256,6 +2267,15 @@ public:
         return it->second->description;
     }
 
+    std::string get_static_buffer_desc(uint32_t index)
+    {
+        if (index < network_buffers_static_list.size())
+        {
+            return network_buffers_static_list[index]->description;
+        }
+
+        return "";
+    }
     std::string get_static_buffer_setup(std::string& name)
     {
         auto hs = shznet_hash(name);
@@ -2263,6 +2283,16 @@ public:
         if (it == network_buffers_static.end())
             return "";
         return it->second->setup;
+    }
+
+    std::string get_static_buffer_setup(uint32_t index)
+    {
+        if (index < network_buffers_static_list.size())
+        {
+            return network_buffers_static_list[index]->setup;
+        }
+
+        return "";
     }
 
     uint32_t get_static_buffer_size(std::string& name)
@@ -2696,6 +2726,8 @@ public:
                     network_buffer_send.add_int64("idx", network_buffers_static_sendindex);
                     size_t network_buffer_size_low = network_buffer_send.get_buffer().size();
 
+                    bool active_send = false;
+
                     for (; network_buffer_current < network_buffers_static_list.size();)
                     {
                         if (check_packet_pacing(false)) //just read counter
@@ -2726,6 +2758,7 @@ public:
                         bps_counter += network_buffer_send.get_buffer().size();
                         current_pkts_per_loop += 1.f;
                         check_packet_pacing(); //now increase counter
+                        active_send = true;
                     }
 
                     if (network_buffer_send.get_buffer().size() > network_buffer_size_low)
@@ -2736,6 +2769,14 @@ public:
                         bps_counter += network_buffer_send.get_buffer().size();
                         current_pkts_per_loop += 1.f;
                         check_packet_pacing();
+                        active_send = true;
+                    }
+
+                    //If we are actively spamming buffer updates like artnet, dont let the device timeout (even if it does timeout)
+                    //To ensure continous updating even if the connection is very bad and we dont receive healthy status messages
+                    if (active_send)
+                    {
+                        reset_timeout();
                     }
                 }
             }
@@ -3578,7 +3619,9 @@ protected:
 
     bool            send_artnet_sync = true;
     int             artnet_send_group = 0;
-    shznet_timer    artnet_delay = shznet_timer(4); //target to send 16 universes at 60 FPS with 4 universes every 2 milliseconds
+    shznet_timer    artnet_delay = shznet_timer(2); //target to send 16 universes at 60 FPS with 4 universes every 2-4 milliseconds
+                                                    //Really not sure what the right value would be for this as this depends on the device + the OS actually sending data...
+                                                    //2 seems to work fine with esp32, 3 would be a good middle ground and 4 is the max this value should ever be.
 
     bool            m_shizonet_enabled = true;
 

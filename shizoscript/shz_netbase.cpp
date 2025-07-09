@@ -1,4 +1,12 @@
 
+/*
+ * Copyright (c) 2018–Now Erik Mackrodt. All rights reserved.
+ *
+ * This file is part of Shizotech™ software, developed and maintained by Erik Mackrodt.
+ *
+ * For inquiries, please visit: https://shizotech.com
+ */
+
 #ifdef ARDUINO
 #include <shizonet.h>
 #include <shz_script.h>
@@ -454,6 +462,35 @@ public:
 				}
 
 			}, 0, true, false, "()");
+		
+		scriptFunction("get_static_buffer_desc", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				auto jh = result.get_json(true);
+				if (!obj->m_device) { return; }
+				if (params.size() != 1)
+					return;
+
+				if (params[0]->is_int() || params[0]->is_float())
+				{
+					jh->push_string(obj->m_device->get_static_buffer_desc(params[0]->get_int()), "description");
+					jh->push_string(obj->m_device->get_static_buffer_setup(params[0]->get_int()), "setup");
+				}
+				else
+				{
+					auto buffer_name = params[0]->get_string();
+					jh->push_string(obj->m_device->get_static_buffer_desc(buffer_name), "description");
+					jh->push_string(obj->m_device->get_static_buffer_setup(buffer_name), "setup");
+				}
+
+			}, 1, true, false, "(index|name)");
+
+		scriptFunction("get_static_buffer_count", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				result.initInt(obj->m_device->get_static_buffer_count());
+
+			}, 0, true, false, "()");
+
+		
 		scriptFunction("set_static_buffer", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
 			{
 				auto jh = result.get_json(true);
@@ -1433,6 +1470,56 @@ public:
 				}
 
 				obj->m_artnet_connect_cbs.push_back(shzvar_shared(params[0]));
+
+				for (auto it : obj->m_artnet_devices)
+				{
+					auto fn = params[0]->getFunction();
+
+					if (!fn)
+						return;
+
+					auto p1 = fn->getParam(0);
+					if (p1)
+					{
+						ShizoArtnetDevice* tmp_dev = new ShizoArtnetDevice(it.second);
+						tmp_dev->associateVar(p1);
+						fn->run();
+					}
+				}
+
+			}, 1, true, false, "(cb)");
+
+		scriptFunction("on_any_connect", [](ShizoNetBase* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
+			{
+				if (params.size() != 1 || params[0]->Type != SHZVAR_FUNC)
+					return;
+
+				auto fn = params[0]->getFunction();
+
+				if (!fn)
+				{
+					blk->runtimeError("shz_net", "Not a function!");
+					return;
+				}
+
+				obj->m_connect_cbs.push_back(shzvar_shared(params[0]));
+				obj->m_artnet_connect_cbs.push_back(shzvar_shared(params[0]));
+
+				for (auto it : obj->m_devices)
+				{
+					auto fn = params[0]->getFunction();
+
+					if (!fn)
+						return;
+
+					auto p1 = fn->getParam(0);
+					if (p1)
+					{
+						ShizoNetDevice* tmp_dev = new ShizoNetDevice(it.second);
+						tmp_dev->associateVar(p1);
+						fn->run();
+					}
+				}
 
 				for (auto it : obj->m_artnet_devices)
 				{

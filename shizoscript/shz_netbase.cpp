@@ -490,43 +490,6 @@ public:
 
 			}, 0, true, false, "()");
 
-		
-		scriptFunction("set_static_buffer", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
-			{
-				auto jh = result.get_json(true);
-				if (!obj->m_device) { return; }
-
-				auto names = obj->m_device->get_static_buffer_names();
-
-				for (auto& it : names)
-				{
-					auto sub = jh->push_var(it)->get_json(true);
-					sub->push_string(obj->m_device->get_static_buffer_desc(it), "description");
-					sub->push_string(obj->m_device->get_static_buffer_setup(it), "setup");
-					sub->push_int(obj->m_device->get_static_buffer_size(it), "size");
-
-					switch (obj->m_device->get_static_buffer_type(it))
-					{
-					case NETWORK_BUFFER_STATIC_DATA:
-						sub->push_string("data", "type");
-						break;
-					case NETWORK_BUFFER_STATIC_LEDS_1CH:
-						sub->push_string("led_1ch", "type");
-						break;
-					case NETWORK_BUFFER_STATIC_LEDS_3CH:
-						sub->push_string("led_3ch", "type");
-						break;
-					case NETWORK_BUFFER_STATIC_LEDS_4CH:
-						sub->push_string("led_4ch", "type");
-						break;
-					default:
-						break;
-					}
-				}
-
-			}, 0, true, false, "()");
-
-
 		scriptFunction("still_valid", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
 			{
 				if (!obj->m_device) { result.initInt(0);  return; }
@@ -1050,11 +1013,7 @@ public:
 				}
 				else
 				{
-					size_t data_offset = params.size() >= 4 ? params[3]->get_int() : 0;
-					size_t data_size = params.size() >= 5 ? params[4]->get_int() : 0;
-
-
-					//obj->m_device->set_artnet_buffer(universe, start_adr, (byte)params[2]->get_int(), data_size, data_offset, wrap_leds);
+					SLH_Instance()->logerror("No data buffer!");
 				}
 
 			}, 6, true, false, "(universe, start_index, buffer, buffer_offset, buffer_size, input_channels)");

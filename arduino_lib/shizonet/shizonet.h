@@ -21,8 +21,8 @@ extern char* ota_subclass;
 #define SHZNET_MAX_RECV (1024 * 10) //10kb
 #define SHZNET_MAX_RECV_BUFFERS (4) //3 Buffers (~30kb)
 #define SHZNET_MAX_RECV_OOB (1024 * 10) //10kb OOB data 
-#define SHZNET_PACKET_PACING_COUNT 2 //Send X packets at once and then wait for the microcontroller to process them before sending more
-                                    //This is based on the arduino pacing code which sends packets every 4 ms (to get 60 FPS at 16ms total window, sending 4*4 universes over that window)
+#define SHZNET_PACKET_PACING_COUNT 1 //Send X packets at once and then wait for the microcontroller to process them before sending more
+                                    //This is based on the arduino pacing code which sends packets every 2 ms (to get 60 FPS at 16ms total window, sending 4*4 universes over that window)
                                     //You can send a total of SHZNET_PACKET_PACING_COUNT * 4 per frame before it will start to lag (sadly RECVMSGBOXSIZE in ESP IDF is pretty low...)
                                     //This value has been carefully trial and error'd, trying to get more data through the ESP by sending more packets
                                     //is generally a bad idea, the only thing you can do is increase the payload on each packet to get more data thru
@@ -401,18 +401,9 @@ public:
             m_order_check_flag = true;
         }
 
-        if (art_frame_callback)
+        if (art_frame_callback && !art_sync_timer.check())
         {
-            if (artnet_frame_timer.check())
-            {
-                if (artnet_frame_due)
-                {
-                    artnet_frame_due = 0;
-                    if (art_sync_timer.check())
-                        art_frame_callback(m_next_frame_recv_time + artnet_frame_timer.get_wait_time());
-                }
-            }
-            else if (art_sync_time > 16.f && (shznet_millis() - expected_art_sync_time) > art_sync_time * 1.2)
+            if (art_sync_time > 16.f && (shznet_millis() - expected_art_sync_time) > art_sync_time * 1.5)
             {
                 art_frame_callback(m_next_frame_recv_time + artnet_frame_timer.get_wait_time());
                 expected_art_sync_time = shznet_millis();
@@ -795,7 +786,7 @@ public:
                 if (incomingUniverse >= ARTNET_UNIVERSE_MAX)
                     return false;
 
-                auto frame_pkt_delay = recv_time - artnet_last_frame_time;
+                /*auto frame_pkt_delay = recv_time - artnet_last_frame_time;
                 artnet_last_frame_time = recv_time;
 
                 if (frame_pkt_delay > 10)
@@ -804,9 +795,9 @@ public:
                     //reset all universes.
                     for (int i = 0; i < ARTNET_UNIVERSE_MAX; i++)
                     {
-                        dmx_frame->rcv1[i] = dmx_frame->rcv2[i];
+                        //dmx_frame->rcv1[i] = dmx_frame->rcv2[i];
                     }
-                }
+                }*/
 
                 int universe = incomingUniverse;
 
@@ -830,10 +821,13 @@ public:
                 dmx_frame->last[universe] = curm;
 
                 m_next_frame_recv_time = recv_time;
-                bool showframe = true;
 
-                if (dmx_frame->rcv2[universe] == (dmx_frame->rcv1[universe] + 1))
+                bool showframe = true;
+                int missed_pkts_start_uni = -1;
+
+                if (dmx_frame->rcv2[universe] != dmx_frame->rcv1[universe])
                 {
+                    missed_pkts_start_uni = universe;
                     m_missed_artnet_pkts++;
                 }
                 else
@@ -859,8 +853,18 @@ public:
                         if (dmx_frame->fps[i] > m_artnet_maxfps)
                             m_artnet_maxfps = dmx_frame->fps[i];
                     }
-                    artnet_frame_due = true;
+
+                    //Fix up current frame, we havent finished the last one yet but pkts are missing, make sure this frame gets the chance to update now
+                    if(missed_pkts_start_uni >= 0)
+                        dmx_frame->rcv2[missed_pkts_start_uni] = dmx_frame->rcv1[missed_pkts_start_uni] + 1;
+
                     artnet_frame_timer.reset();
+
+                    if (art_sync_timer.check())
+                    {
+                        if (art_frame_callback) art_frame_callback(0);
+                    }
+                    
                     return true;
                 }
             }
@@ -881,7 +885,17 @@ public:
         }
         else if (opcode == ART_SYNC)
         {
-            artnet_frame_due = false;
+            if (dmx_frame)
+            {
+                for (int i = 0; i < ARTNET_UNIVERSE_MAX; i++)
+                {
+                    //If we received all active universes already, then the dmx handle function should have reset all rcv caches to zero already
+                    if (dmx_frame->active[i] == 2 && dmx_frame->rcv1[i] != dmx_frame->rcv2[i])
+                        m_missed_artnet_pkts++;
+                    dmx_frame->rcv1[i] = dmx_frame->rcv2[i] = 0;
+                }
+            }
+
             art_sync_timer.reset();
 
             auto recv_delta = recv_time - expected_art_sync_time;
@@ -890,7 +904,7 @@ public:
             expected_art_sync_time = recv_time;
             art_sync_time = new_time * 0.01 + art_sync_time * 0.99;
 
-            if (art_frame_callback && recv_delta >= 15) art_frame_callback(0);
+            if (art_frame_callback && recv_delta >= 10) art_frame_callback(0);
 
             return false;
         }
@@ -1500,11 +1514,10 @@ protected:
 
     std::function<void(uint16_t universe, uint16_t length, uint8_t sequence, uint8_t* data, shznet_ip remoteIP)> art_dmx_callback = 0;
     std::function<void(uint64_t)> art_frame_callback = 0;
-    shznet_timer art_sync_timer = shznet_timer(1000 * 10);
+    shznet_timer art_sync_timer = shznet_timer(1000 * 3);
     uint64_t expected_art_sync_time;
     float art_sync_time = 0.0;
 
-    bool            artnet_frame_due = false;
     shznet_timer    artnet_frame_timer = shznet_timer(4);
     uint64_t        artnet_last_frame_time = 0;
 
@@ -1862,7 +1875,7 @@ protected:
 
     //Static buffer diags
     uint64_t static_buffers_sendindex = 0;
-    shznet_timer static_buffers_diag_timer = shznet_timer(500);
+    shznet_timer static_buffers_diag_timer = shznet_timer(16);
  
     friend class shznet_base_impl;
     friend class shznet_base;
@@ -2563,6 +2576,7 @@ public:
 
         bool flush_buffer = false;
 
+        bool send_group_update = m_current_send_group != send_group;
         m_current_send_group = send_group;
 
         while (keep_sending)
@@ -2716,10 +2730,19 @@ public:
                 }
             }
 
-            if (network_buffers_static_list.size() && send_group >= 0)
+            if (network_buffers_static_list.size() && send_group >= 0 && send_group_update)
             {
-                if (send_group == 0 && network_buffer_current >= network_buffers_static_list.size())
-                    network_buffer_current = 0;
+                if (send_group == 0)
+                {
+                    if(network_buffer_current >= network_buffers_static_list.size())
+                        network_buffer_current = 0;
+                    else
+                    {
+#ifdef _WIN32
+                        printf("shznet static buffer send overrun (%i < %i)!\n", (int)network_buffer_current, (int)network_buffers_static_list.size());
+#endif
+                    }
+                }
                 if (network_buffer_current < network_buffers_static_list.size())
                 {
                     network_buffer_send.clear();
@@ -2763,6 +2786,9 @@ public:
 
                     if (network_buffer_send.get_buffer().size() > network_buffer_size_low)
                     { 
+                        if (network_buffer_current == network_buffers_static_list.size())
+                            network_buffer_send.add_int32("end", 1);
+
                         this->send_unreliable("SHZSET_STATIC_BUFFER", network_buffer_send.get_buffer().data(), network_buffer_send.get_buffer().size(), SHZNET_PKT_FMT_KEY_VALUE, true);
                         network_buffers_static_sendindex++;
                         pps_counter++;
@@ -3062,7 +3088,8 @@ public:
         nb.ensure_init();
 
         size_t rem_bytes = data_size;
-        int target_channels = nb.type;
+
+        int target_channels = std::clamp((int)nb.type, 1, 4);
 
         data_buffer += data_offset;
         start_adr *= target_channels;
@@ -3471,7 +3498,7 @@ public:
 
     void update(int artnet_send_group)
     {
-        if (artnet_send_group >= 0)
+        if (artnet_send_group >= 0 && artnet_send_group < 4)
         {
             send_art_current(artnet_send_group);
         }
@@ -3950,7 +3977,7 @@ public:
 
                 artnet_send_group++;
 
-                if (artnet_send_group >= 4)
+                if (artnet_send_group >= 8)
                 {
                     artnet_send_group = -1;
                     artnet_delay.update_period(false);
@@ -3993,7 +4020,7 @@ public:
 #ifdef _WIN32
            //printf("ARTNET OVERRUN! %i %i\n", artnet_send_group, (int)artnet_sync_fps_debug.delay_reset());
 #endif
-            for (int i = artnet_send_group; i < 4; i++)
+            for (int i = artnet_send_group; i < 8; i++)
             {
 
                 for (auto &it : m_artnet_devices)
@@ -4007,11 +4034,11 @@ public:
         if (send_artnet_sync)
         {
             send_art_sync(shznet_broadcast_ip);
-            artnet_delay.reset();
         }
 
         //framesync now and start sending next data (one frame delay? can that be avoided?)
         artnet_send_group = 0;
+        artnet_delay.reset();
     }
 
     void disconnect_device(shznet_mac& id, const char* reason)
@@ -4871,17 +4898,34 @@ public:
                     {
                         if (send_index > dev->static_buffers_sendindex)
                         {
-                            if (send_index != dev->static_buffers_sendindex + 1 && dev->static_buffers_diag_timer.update())
+                            if (send_index != dev->static_buffers_sendindex + 1)
                             {
-                                //Notify device that we are loosing packets
-                                uint32_t missing_pkt_count = (send_index - dev->static_buffers_sendindex) - 1;
-                                kvw.clear();
-                                kvw.add_int32("missing", missing_pkt_count);
-                                dev->send_unreliable("SHZDIAG_STATIC_BUFFER", kvw.get_buffer().data(), kvw.get_buffer().size(), SHZNET_PKT_FMT_INT32);
+#ifdef ARDUINO
+                                Serial.print(send_index);
+                                Serial.print(" : ");
+                                Serial.print(dev->static_buffers_sendindex);
+                                Serial.println("Missed shznet static buffer packets!");
+#endif
+                                if (dev->static_buffers_diag_timer.update())
+                                {
+                                    //Notify device that we are loosing packets
+                                    uint32_t missing_pkt_count = (send_index - dev->static_buffers_sendindex) - 1;
+                                    kvw.clear();
+                                    kvw.add_int32("missing", missing_pkt_count);
+                                    dev->send_unreliable("SHZDIAG_STATIC_BUFFER", kvw.get_buffer().data(), kvw.get_buffer().size(), SHZNET_PKT_FMT_INT32);
+                                }
                             }
                         }
 
                         dev->static_buffers_sendindex = send_index;
+                    }
+                }
+
+                if (reader.read_key("end"))
+                {
+                    if (art_sync_timer.check() && art_frame_callback)
+                    {
+                        art_frame_callback(0);
                     }
                 }
             });
@@ -4902,6 +4946,15 @@ public:
                 if (dev)
                 {
                     std::string msg = "Device " + dev->get_name() + " (" + dev->get_mac().str() + ") lost " + std::to_string(missing_pkts_count) + " pkts.\n";
+#ifdef ARDUINO
+                    Serial.println(msg.c_str());
+#else
+                    printf(msg.c_str());
+#endif
+                }
+                else
+                {
+                    std::string msg = "Unknown Device lost " + std::to_string(missing_pkts_count) + " pkts.\n";
 #ifdef ARDUINO
                     Serial.println(msg.c_str());
 #else

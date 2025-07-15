@@ -1070,6 +1070,16 @@ public:
         return false;
     }
 
+    uint64_t check_time_left()
+    {
+        if (wait_time == 0)
+            return 0;
+        uint64_t current_time = shznet_millis();
+        if (current_time >= start_time + wait_time)
+            return 0;
+        return (start_time + wait_time) - current_time;
+    }
+
     uint64_t delay()
     {
         return shznet_millis() - start_time;

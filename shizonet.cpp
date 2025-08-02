@@ -11,9 +11,9 @@
 
 void* shznet_malloc(size_t size)
 {
-#ifdef __XTENSA__
+#ifdef ARDUINO_ARCH_ESP32
     //check here if we have free SRAM, try to allocate stuff there first
-    if (psramInit() && ((ESP.getFreeHeap()+size) < 1024 * 150))
+    if (psramInit() && ((ESP.getFreeHeap()+size) < 1024 * 100))
         return ps_malloc(size);
 #endif
     return malloc(size);
@@ -22,7 +22,7 @@ void* shznet_malloc(size_t size)
 shznet_ip shznet_broadcast_ip = shznet_ip(255, 255, 255, 255, ART_NET_PORT);
 shznet_mac shznet_broadcast_mac = shznet_mac((byte*)"\xFF\xFF\xFF\xFF\xFF\xFF");
 
-#if defined(ARDUINO) && !defined(__XTENSA__)
+#if defined(ARDUINO) && !defined(ARDUINO_ARCH_ESP32)
 uint64_t shznet_millis()
 {
     static uint32_t low32, high32;
@@ -186,6 +186,164 @@ void shznet_device::send_fetch(std::shared_ptr<fetch_command_s> fetch_cmd)
     }
 }
 
+
+void shznet_device::handle_ack(shznet_pkt_ack* pkt)
+{
+    command_buffer_s* cmd_buff = 0;
+
+    if (zombie_buffers.size() && zombie_buffers.front()->ticketid == pkt->ticketid)
+    {
+        cmd_buff = zombie_buffers.front();
+    }
+
+    if (!cmd_buff)
+    {
+        if (ordered_buffers.size() && ordered_buffers.front()->ticketid == pkt->ticketid)
+        {
+            cmd_buff = ordered_buffers.front();
+        }
+    }
+
+    if (!cmd_buff)
+    {
+        for (auto it : unordered_buffers)
+        {
+            if (it->ticketid == pkt->ticketid)
+            {
+                cmd_buff = it;
+                break;
+            }
+        }
+    }
+
+    if (!cmd_buff)
+    {
+        for (auto it : response_buffers)
+        {
+            if (it->ticketid == pkt->ticketid)
+            {
+                cmd_buff = it;
+                break;
+            }
+        }
+    }
+
+    if (!cmd_buff)
+    {
+        //NETPRNT("invalid ack!");
+        return;
+    }
+
+    if (pkt->type == shznet_ack_request_delete_buffer)
+    {
+        //NETPRNT("cmd executed and freed!");
+        clear_command_buffer(pkt->ticketid);
+        return;
+    }
+
+    if (pkt->type == shznet_ack_request_ping)
+    {
+        auto new_ping = std::min(999, std::max(1, (int)(cmd_buff->ping_timer.delay())));
+        m_ping = (float)new_ping * 0.1 + (float)m_ping * 0.9;
+        //if (new_ping >= m_ping)
+        //    m_ping = new_ping;
+        //else
+        //    m_ping = (float)new_ping * 0.1 + (float)m_ping * 0.9;
+        NETPRNT_FMT("received ping: %i\n", m_ping);
+    }
+    else if ((pkt->type == shznet_ack_request_quick_resend) || pkt->type == shznet_ack_request_resend)
+    {
+        if (pkt->type == shznet_ack_request_resend && pkt->ack_id != cmd_buff->ack_id)
+            return;
+
+        if (cmd_buff->missing_chunks.size() != cmd_buff->pkts.size())
+        {
+            cmd_buff->missing_chunks.resize(cmd_buff->pkts.size());
+            std::fill(cmd_buff->missing_chunks.begin(), cmd_buff->missing_chunks.end(), false);
+
+        }
+
+        for (uint64_t chunk_id = pkt->missing_start_id; chunk_id <= std::min(pkt->missing_end_id, (uint64_t)cmd_buff->pkts.size() - 1); chunk_id++) cmd_buff->missing_chunks[chunk_id] = 1;
+
+        if (cmd_buff->missing_chunk_low == -1)
+            cmd_buff->missing_chunk_low = pkt->missing_start_id;
+        else
+            cmd_buff->missing_chunk_low = std::min(pkt->missing_start_id, cmd_buff->missing_chunk_low);
+
+        if (cmd_buff->missing_chunk_high == -1)
+            cmd_buff->missing_chunk_high = pkt->missing_end_id;
+        else
+            cmd_buff->missing_chunk_high = std::max(pkt->missing_end_id, cmd_buff->missing_chunk_high);
+    }
+    else if (pkt->type == shznet_ack_request_complete || pkt->type == shznet_ack_request_too_big)
+    {
+        if (pkt->missing_start_id == -2 && pkt->missing_end_id == -2) //order not found (no pkt arrived on single packet cmds for example)
+        {
+            NETPRNT("order not found! resending whole order...");
+
+            cmd_buff->send_index = 0;
+            cmd_buff->start_ack = 0;
+            cmd_buff->start_cleanup = 0;
+            cmd_buff->missing_chunk_low = -1;
+            cmd_buff->missing_chunk_high = -1;
+            return;
+        }
+
+        if (pkt->missing_start_id == -4 && pkt->missing_end_id == -4) //order not found (no pkt arrived on single packet cmds for example)
+        {
+            NETPRNT("device disconnected (or restarted)");
+
+            base->disconnect_device(get_mac(), "Restarted");
+            return;
+        }
+
+        bool pkt_failed = pkt->missing_start_id == -1 && pkt->missing_end_id == -1;
+        bool pkt_finished = pkt->missing_start_id == 0 && pkt->missing_end_id == -1;
+
+        if (pkt_failed || pkt_finished)
+        {
+            for (auto it = send_finish_callbacks.begin(); it != send_finish_callbacks.end(); it++)
+            {
+                if (it->first == pkt->ticketid)
+                {
+                    it->second(!pkt_failed);
+                    send_finish_callbacks.erase(it);
+                    break;
+                }
+            }
+        }
+
+        if (pkt_finished)
+        {
+            //NETPRNT_FMT("cmd executed! time: %llu\n", cmd_buff->start_time.delay());
+            cmd_buff->start_cleanup = true;
+            cmd_buff->ack_counter.set_interval(1, 8);
+            return;
+        }
+        else if (pkt_failed)
+        {
+            NETPRNT_ERR("cmd failed to execute on device!");
+            clear_command_buffer(pkt->ticketid, true);
+            return;
+        }
+
+        if (pkt->ack_id != cmd_buff->ack_id)
+            return;
+
+        if (pkt->missing_start_id == -3 && pkt->missing_end_id == -3) //there are still packets missing...
+        {
+            cmd_buff->start_ack = false;
+            cmd_buff->ack_id++;
+            return;
+        }
+    }
+    else if (pkt->type == shznet_ack_request_busy)
+    {
+        cmd_buff->device_busy = true;
+        cmd_buff->device_busy_timer.reset();
+    }
+
+}
 
 bool shznet_device::sendto(void* buffer, size_t size)
 {

@@ -7,34 +7,55 @@
  * For inquiries, please visit: https://shizotech.com
  */
 
-#pragma once
+#ifndef __SHZNET_H__
+#define __SHZNET_H__
 
 #include "shizonet_platform.h"
 #define SHZNET_COMPAT_VERSION 14
-#undef min
 
-#ifdef __XTENSA__
-//TODO: find a better (secure) way to do this...
-#define ESP32_OTA
-extern char* ota_class;
-extern char* ota_subclass;
-#define SHZNET_MAX_RECV (1024 * 10) //10kb
-#define SHZNET_MAX_RECV_BUFFERS (4) //3 Buffers (~30kb)
-#define SHZNET_MAX_RECV_OOB (1024 * 10) //10kb OOB data 
-#define SHZNET_PACKET_PACING_COUNT 1 //Send X packets at once and then wait for the microcontroller to process them before sending more
-                                    //This is based on the arduino pacing code which sends packets every 2 ms (to get 60 FPS at 16ms total window, sending 4*4 universes over that window)
-                                    //You can send a total of SHZNET_PACKET_PACING_COUNT * 4 per frame before it will start to lag (sadly RECVMSGBOXSIZE in ESP IDF is pretty low...)
-                                    //This value has been carefully trial and error'd, trying to get more data through the ESP by sending more packets
-                                    //is generally a bad idea, the only thing you can do is increase the payload on each packet to get more data thru
+#ifdef ARDUINO_ARCH_ESP32
+//esp32 can have OSC support
+#define SHZNET_OSC_SUPPORT
+#include "osc/client.hpp"
 #else
-#define SHZNET_MAX_RECV (-1)
-#define SHZNET_MAX_RECV_BUFFERS (-1)
-#define SHZNET_MAX_RECV_OOB (1024 * 1024) //1mb OOB data 
-#define SHZNET_PACKET_PACING_COUNT 0
+#ifndef ARDUINO
+//Arduino default to no OSC support, all other platforms can have it
+#define SHZNET_OSC_SUPPORT
+#include "osc/client.hpp"
+#endif
+#endif
+
+
+
+
+#ifdef ARDUINO_ARCH_ESP32
+    #if defined(ESP_P4) || defined(ESP32_P4) //Stronger
+        #define SHZNET_MAX_RECV (1024 * 10) 
+        #define SHZNET_MAX_RECV_BUFFERS (8) 
+        #define SHZNET_MAX_RECV_OOB (1024 * 10) 
+        #define SHZNET_PACKET_PACING_COUNT 8
+    #else
+        #define SHZNET_MAX_RECV (1024 * 10) //10kb
+        #define SHZNET_MAX_RECV_BUFFERS (4) //3 Buffers (~30kb)
+        #define SHZNET_MAX_RECV_OOB (1024 * 10) //10kb OOB data 
+        #define SHZNET_PACKET_PACING_COUNT 1 //Send X packets at once and then wait for the microcontroller to process them before sending more
+                                            //This is based on the arduino pacing code which sends packets every 2 ms (to get 60 FPS at 16ms total window, sending 4*4 universes over that window)
+                                            //You can send a total of SHZNET_PACKET_PACING_COUNT * 4 per frame before it will start to lag (sadly RECVMSGBOXSIZE in ESP IDF is pretty low...)
+                                            //This value has been carefully trial and error'd, trying to get more data through the ESP by sending more packets
+                                            //is generally a bad idea, the only thing you can do is increase the payload on each packet to get more data thru
+    #endif
+#else
+    #define SHZNET_MAX_RECV (-1)
+    #define SHZNET_MAX_RECV_BUFFERS (-1)
+    #define SHZNET_MAX_RECV_OOB (1024 * 1024) //1mb OOB data 
+    #define SHZNET_PACKET_PACING_COUNT 0
 #endif
 
 #define INVALID_SESSIONID shznet_sessionid(-1)
 #define INVALID_TICKETID shznet_ticketid(-1)
+
+//F windows
+#undef min
 
 struct shznet_config
 {
@@ -233,6 +254,8 @@ protected:
     shznet_timer                                    order_update = shznet_timer(1000 * 5);
 
     uint32_t m_open_streams[SHZNET_MAX_STREAMS] = { 0 }; //kinda thread safe
+
+    shznet_timer last_buffer_update; //Can be used to check wether we are receiving artnet/shizonet packets currently (specifically static buffer updates)
 
     bool check_open_stream(uint32_t cmd_name)
     {
@@ -476,7 +499,7 @@ public:
             {
                 bool exit_loop = false;
                 if (art_dmx_callback || art_frame_callback || m_always_enable_artnet)
-                {
+                {                
                     exit_loop = handle_artnet(packet_ip, (byte*)packet_data, packet_len, packet_recv_time);
                 }
                 m_udp.flush_packet();
@@ -700,7 +723,7 @@ public:
     virtual void handle_shizonet_auth_beacon(shznet_ip& adr, shznet_pkt* pkt)
     {
         shznet_mac target_mac(pkt->source_mac());
-        //NETPRNT_FMT("auth beacon(1) from: %s (%s:%i)\n", target_mac.str().c_str(), adr.str().c_str(), adr.port);
+        NETPRNT_FMT("auth beacon(1) from: %s (%s:%i)\n", target_mac.str().c_str(), adr.str().c_str(), adr.port);
         auto endpoint = m_endpoints.find(target_mac);
         shznet_sessionid sessid = -1;
         if (endpoint != m_endpoints.end())
@@ -772,6 +795,8 @@ public:
 
         if (opcode == ART_DMX)
         {
+            last_buffer_update.update();
+
             sequence = artnetPacket[12];
             incomingUniverse = artnetPacket[14] | artnetPacket[15] << 8;
             dmxDataLength = artnetPacket[17] | artnetPacket[16] << 8;
@@ -1287,18 +1312,21 @@ public:
         auto ep = m_endpoints.find(target_mac);
         if (ep == m_endpoints.end() || pkt->sessionid != ep->second.sessionid)
         {
+            if (ep != m_endpoints.end() && pkt->sessionid != ep->second.sessionid)
+                m_endpoints.erase(ep);
             NETPRNT("invalid ackreq pkt received!");
             shznet_pkt_ack ack;
             ack.sessionid = pkt->sessionid;
             ack.ticketid = pkt->ticketid;
             memcpy(ack.mac, local_mac().mac, 6);
-            ack.type = pkt->type;
-            ack.missing_start_id = -2;
-            ack.missing_end_id = -2;
+            ack.type = shznet_ack_request_complete;
+            ack.missing_start_id = -4;
+            ack.missing_end_id = -4;
             ack.ack_id = pkt->ack_id;
             ack.make_checksum();
             m_udp.send_buffered_prio(adr, (byte*)&ack, sizeof(shznet_pkt_ack));
             return;
+            
         }
 
         auto& orders = ep->second.orders;
@@ -2093,6 +2121,7 @@ public:
         timeout.set_interval(1000 * 60);
 
         offline_timeout.set_interval(1000 * 60 * 60 * 24);
+        offline_timeout.reset();
 
         address = adr;
 
@@ -2136,8 +2165,6 @@ public:
         else
             timeout.set_interval(1000 * 10);
 
-        offline_timeout.set_interval(1000 * 60 * 10);
-
         reconnect_device(adr);
     }
 
@@ -2171,8 +2198,6 @@ public:
         connected = false;
         m_ticketid_counter = 1;
         reset_offline_timeout();
-        if (auth.allocated())
-            auth.release();
 
         clear_command_buffers();
 
@@ -2830,155 +2855,7 @@ public:
         }
     }
 
-    void handle_ack(shznet_pkt_ack* pkt)
-    {
-        command_buffer_s* cmd_buff = 0;
-
-        if (zombie_buffers.size() && zombie_buffers.front()->ticketid == pkt->ticketid)
-        {
-            cmd_buff = zombie_buffers.front();
-        }
-
-        if (!cmd_buff)
-        {
-            if (ordered_buffers.size() && ordered_buffers.front()->ticketid == pkt->ticketid)
-            {
-                cmd_buff = ordered_buffers.front();
-            }
-        }
-
-        if (!cmd_buff)
-        {
-            for (auto it : unordered_buffers)
-            {
-                if (it->ticketid == pkt->ticketid)
-                {
-                    cmd_buff = it;
-                    break;
-                }
-            }
-        }
-
-        if (!cmd_buff)
-        {
-            for (auto it : response_buffers)
-            {
-                if (it->ticketid == pkt->ticketid)
-                {
-                    cmd_buff = it;
-                    break;
-                }
-            }
-        }
-
-        if (!cmd_buff)
-        {
-            //NETPRNT("invalid ack!");
-            return;
-        }
-
-        if (pkt->type == shznet_ack_request_delete_buffer)
-        {
-            //NETPRNT("cmd executed and freed!");
-            clear_command_buffer(pkt->ticketid);
-            return;
-        }
-
-        if (pkt->type == shznet_ack_request_ping)
-        {
-            auto new_ping = std::min(999, std::max(1, (int)(cmd_buff->ping_timer.delay())));
-            m_ping = (float)new_ping * 0.1 + (float)m_ping * 0.9;
-            //if (new_ping >= m_ping)
-            //    m_ping = new_ping;
-            //else
-            //    m_ping = (float)new_ping * 0.1 + (float)m_ping * 0.9;
-            NETPRNT_FMT("received ping: %i\n", m_ping);
-        }
-        else if ((pkt->type == shznet_ack_request_quick_resend) || pkt->type == shznet_ack_request_resend)
-        {
-            if (pkt->type == shznet_ack_request_resend && pkt->ack_id != cmd_buff->ack_id)
-                return;
-
-            if (cmd_buff->missing_chunks.size() != cmd_buff->pkts.size())
-            {
-                cmd_buff->missing_chunks.resize(cmd_buff->pkts.size());
-                std::fill(cmd_buff->missing_chunks.begin(), cmd_buff->missing_chunks.end(), false);
-
-            }
-
-            for (uint64_t chunk_id = pkt->missing_start_id; chunk_id <= std::min(pkt->missing_end_id, (uint64_t)cmd_buff->pkts.size() - 1); chunk_id++) cmd_buff->missing_chunks[chunk_id] = 1;
-
-            if (cmd_buff->missing_chunk_low == -1)
-                cmd_buff->missing_chunk_low = pkt->missing_start_id;
-            else
-                cmd_buff->missing_chunk_low = std::min(pkt->missing_start_id, cmd_buff->missing_chunk_low);
-
-            if (cmd_buff->missing_chunk_high == -1)
-                cmd_buff->missing_chunk_high = pkt->missing_end_id;
-            else
-                cmd_buff->missing_chunk_high = std::max(pkt->missing_end_id, cmd_buff->missing_chunk_high);
-        }
-        else if (pkt->type == shznet_ack_request_complete || pkt->type == shznet_ack_request_too_big)
-        {
-            if (pkt->missing_start_id == -2 && pkt->missing_end_id == -2) //order not found (no pkt arrived on single packet cmds for example)
-            {
-                NETPRNT("order not found! resending whole order...");
-
-                cmd_buff->send_index = 0;
-                cmd_buff->start_ack = 0;
-                cmd_buff->start_cleanup = 0;
-                cmd_buff->missing_chunk_low = -1;
-                cmd_buff->missing_chunk_high = -1;
-                return;
-            }
-
-            bool pkt_failed = pkt->missing_start_id == -1 && pkt->missing_end_id == -1;
-            bool pkt_finished = pkt->missing_start_id == 0 && pkt->missing_end_id == -1;
-
-            if (pkt_failed || pkt_finished)
-            {
-                for (auto it = send_finish_callbacks.begin(); it != send_finish_callbacks.end(); it++)
-                {
-                    if (it->first == pkt->ticketid)
-                    {
-                        it->second(!pkt_failed);
-                        send_finish_callbacks.erase(it);
-                        break;
-                    }
-                }
-            }
-
-            if (pkt_finished)
-            {
-                //NETPRNT_FMT("cmd executed! time: %llu\n", cmd_buff->start_time.delay());
-                cmd_buff->start_cleanup = true;
-                cmd_buff->ack_counter.set_interval(1, 8);
-                return;
-            }
-            else if(pkt_failed)
-            {
-                NETPRNT_ERR("cmd failed to execute on device!");
-                clear_command_buffer(pkt->ticketid, true);
-                return;
-            }
-
-            if (pkt->ack_id != cmd_buff->ack_id)
-                return;
-            
-            if (pkt->missing_start_id == -3 && pkt->missing_end_id == -3) //there are still packets missing...
-            {
-                cmd_buff->start_ack = false;
-                cmd_buff->ack_id++;
-                return;
-            }
-        }
-        else if (pkt->type == shznet_ack_request_busy)
-        {
-            cmd_buff->device_busy = true;
-            cmd_buff->device_busy_timer.reset();
-        }
-        
-    }
+    void handle_ack(shznet_pkt_ack* pkt);
 
     bool sendto(void* buffer, size_t size);
 
@@ -4068,6 +3945,7 @@ public:
             m_devices_offline[id] = dev;
             if(was_online) this->on_device_disconnect_internal(dev, reason);
             dev->set_invalid();
+            dev->reset_offline_timeout();
         }
     }
 
@@ -4103,7 +3981,8 @@ public:
             test_adr.mac = target_mac;
             test_adr.ip = adr;
             test_adr.ip.port = adr.port;
-            send_shz_poll(test_adr);
+            if(is_client_only)
+                send_shz_poll(test_adr);
         }
         else
         {
@@ -4113,6 +3992,8 @@ public:
 
     void handle_shizonet_auth_beacon_reply(shznet_ip& dev_ip, shznet_pkt* pkt) override
     {
+        NETPRNT("auth beacon reply.");
+
         shznet_adr adr(dev_ip.ip, pkt->source_mac(), dev_ip.port);
         auto active_dev = m_devices.find(adr.mac);
         if (active_dev != m_devices.end())
@@ -4146,8 +4027,10 @@ public:
                 
                 //10 secs safety reconnect timer
                 if (!dev->reconnect_timer.update())
+                {
+                    NETPRNT_FMT("ignored auth reply due to reconnect timer %s.\n", dev->name.c_str());
                     return;
-                
+                }
                 dev->reset_offline_timeout();
                 m_devices_offline.erase(offline_dev);
             }
@@ -4167,13 +4050,17 @@ public:
             dev = pending_dev->second;
 
         if (!dev)
+        {
+            NETPRNT("ignored auth reply due to no device.");
             return;
+        }
 
         dev->update_address(adr);
 
         dev->receiver_only = pkt->header.flags & SHZNET_PKT_FLAGS_RECEIVER_ONLY;
 
-        send_auth_req(dev);
+        if(dev->auth.allocated() && dev->auth->resend_timer.update())
+            send_auth_req(dev);
 
         dev->auth->connect_guard.reset();
     }
@@ -4296,6 +4183,9 @@ public:
             m_artnet_devices[art_adr.mac] = new_dev;
             this->on_device_connect_internal(new_dev);
             NETPRNT_FMT("new artnet device: %s\n", poll_reply->shortname);
+
+            //Try shizonet too
+            send_shz_poll(art_adr);
         }
     }
 
@@ -4578,7 +4468,7 @@ public:
     }
 };
 
-#ifdef ESP32_OTA
+#ifdef ESP32_OTA_NAME
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_log.h"
@@ -4626,7 +4516,7 @@ protected:
 
     bool _has_shizoscript_json = false;
 
-#ifdef ESP32_OTA
+#ifdef ESP32_OTA_NAME
     esp_ota_handle_t ota_update_handle = -1;
     esp_partition_t* ota_update_partition = 0;
     bool ota_reboot = 0;
@@ -4865,6 +4755,8 @@ public:
                 if (reader.get_fmt() != SHZNET_PKT_FMT_INT64)
                     return;
 
+                last_buffer_update.update();
+
                 //First item is the send index
                 uint64_t send_index = reader.get_value_type<uint64_t>();
 
@@ -4965,7 +4857,7 @@ public:
             });
 
 
-#ifdef ESP32_OTA
+#ifdef ESP32_OTA_NAME
         add_command_respond("ESP32_OTA_START", [this](std::shared_ptr<shznet_responder> responder)
             {
                 kvw.clear();
@@ -5003,7 +4895,7 @@ public:
 
                 Serial.print("OTA begin with size: ");
                 Serial.println(size);
-                esp_err_t err = esp_ota_begin(ota_update_partition, size == 0 ? OTA_SIZE_UNKNOWN : size, &ota_update_handle);
+                esp_err_t err = esp_ota_begin(ota_update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_update_handle);
                 
                 if (err != ESP_OK) {
                     kvw.add_int32("success", 0);
@@ -5103,8 +4995,8 @@ public:
                 }
 
                 kvw.add_int32("has_ota", 1);
-                kvw.add_string("class", ota_class);
-                kvw.add_string("subclass", ota_subclass);
+                kvw.add_string("class", ESP32_OTA_NAME);
+                kvw.add_string("subclass", ESP32_OTA_CLASS);
 
                 // Add both the raw data and the string representation
                 kvw.add_string("sha256_str", sha_str);
@@ -5144,9 +5036,14 @@ public:
         m_network_buffers_static_names[hs] = name;
     }
 
+    uint64_t is_receiving_data() //TODO: find better name and explanation, can be used to check wether we are receiving buffer updates or not
+    {
+        return last_buffer_update.delay() < 1000 * 5;
+    }
+
     virtual void update() override
     {
-#ifdef ESP32_OTA
+#ifdef ESP32_OTA_NAME
         if (ota_reboot && ota_reboot_timer.update())
             esp_restart();
 #endif
@@ -5184,7 +5081,24 @@ public:
         shznet_base_impl::update();
     }
 
+#ifdef SHZNET_OSC_SUPPORT
+    //OSC support
+    OSCPP::Client::Packet   osc_client_create() { return OSCPP::Client::Packet(osc_buffer, sizeof(osc_buffer)); }
+    void                    osc_client_transmit(shznet_ip ip, OSCPP::Client::Packet& pkt) { sendto(ip, pkt.data(), pkt.size()); }
+#endif
+
+
 protected:
+
+#ifdef SHZNET_OSC_SUPPORT
+
+#if defined(WIN32) || defined(__linux__)
+    char osc_buffer[16000];
+#else
+    char osc_buffer[1500];
+#endif
+
+#endif
 
     void handle_response_add(response_wait rw)
     {
@@ -5281,4 +5195,5 @@ public:
 };
 
 
+#endif
 #endif

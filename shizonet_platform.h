@@ -1243,7 +1243,7 @@ public:
 template<class T>
 class shznet_recycler_locked
 {
-#if defined(__XTENSA__) || !defined(ARDUINO)
+#if defined(ARDUINO_ARCH_ESP32) || !defined(ARDUINO)
     std::mutex m_lock;
 #endif
     shznet_vector<T*>	m_garbage;
@@ -1265,7 +1265,7 @@ public:
     {
         if (!object)
             return;
-#if defined(__XTENSA__) || !defined(ARDUINO)
+#if defined(ARDUINO_ARCH_ESP32) || !defined(ARDUINO)
         std::unique_lock<std::mutex> _grd{ m_lock };
 #endif
         
@@ -2226,8 +2226,8 @@ public:
     }
 };
 
-#ifdef __XTENSA__
-#ifdef ESP_ETH
+#ifdef ARDUINO_ARCH_ESP32
+#if defined(ESP_ETH) || defined(ESP32_ETH)
     //#include <Ethernet.h>
     #include <ETH.h>
 #endif
@@ -2380,7 +2380,7 @@ public:
         bool _local_adr_get = true;
         shznet_adr& local_adr() override
         {
-#ifdef ESP_ETH
+#if defined(ESP_ETH) || defined(ESP32_ETH)
             IPAddress adr;
             if (!ETH.linkUp())
                 adr = WiFi.localIP();

@@ -30,7 +30,7 @@
 
 #ifdef ARDUINO_ARCH_ESP32
     #if defined(ESP_P4) || defined(ESP32_P4) //Stronger
-        #define SHZNET_MAX_RECV (1024 * 10) 
+        #define SHZNET_MAX_RECV (1024 * 100) 
         #define SHZNET_MAX_RECV_BUFFERS (8) 
         #define SHZNET_MAX_RECV_OOB (1024 * 10) 
         #define SHZNET_PACKET_PACING_COUNT 8
@@ -764,6 +764,13 @@ public:
         }
         NETPRNT_FMT("auth request new sessionid: %llu for %s : %i.\n", req->sessionid, target_mac.str().c_str(), (int)adr.port);
         endpoint.sessionid = req->sessionid;
+
+
+        //This request from server A can also act as our final "handshake" from server B
+        //so server A does 3 way handshake
+        //We accept the 2 requests from A as out 3 accept.
+        handle_shizonet_auth_reply(adr, pkt);
+
 
         shznet_pkt_auth_reply repl;
 
@@ -3717,7 +3724,7 @@ public:
 
                             finalize_device_connections.push_back(dev_ptr);
                         },
-                        1000 * 8
+                        1000 * 15
                     );
                 }
             }
@@ -3992,9 +3999,8 @@ public:
 
     void handle_shizonet_auth_beacon_reply(shznet_ip& dev_ip, shznet_pkt* pkt) override
     {
-        NETPRNT("auth beacon reply.");
-
         shznet_adr adr(dev_ip.ip, pkt->source_mac(), dev_ip.port);
+
         auto active_dev = m_devices.find(adr.mac);
         if (active_dev != m_devices.end())
         {
@@ -4013,6 +4019,8 @@ public:
             }
             return;
         }
+
+        NETPRNT_FMT("[AUTH1] Beacon reply from %s\n", adr.mac.str().c_str());
 
         shznet_device_ptr dev = 0;
 
@@ -4035,15 +4043,20 @@ public:
                 m_devices_offline.erase(offline_dev);
             }
             if (!dev)
+            {
                 dev = std::make_shared<shznet_device>(this, adr, "", "");
-            
+                dev->auth->resend_timer.reset(0);
+            }
             dev->set_invalid();
             
-            auto old_sessionid = pkt->header.sessionid;
-            while (dev->auth->sessionid == old_sessionid)
-                dev->auth->sessionid = shznet_global.get_new_sessionid();
-            NETPRNT_FMT("new sessionid: %llu old: %llu for %s.\n", dev->auth->sessionid, old_sessionid, dev->get_mac().str().c_str());;
-            dev->auth->resend_timer.reset();
+            //UPDATE. keep same session ID alive while we are alive?
+            //Doesnt make much sense to change the sessionid unless we restart
+            //And it maybe stops endless reconnect loops
+            //auto old_sessionid = pkt->header.sessionid;
+            //while (dev->auth->sessionid == old_sessionid)
+            //    dev->auth->sessionid = shznet_global.get_new_sessionid();
+            //NETPRNT_FMT("new sessionid: %llu old: %llu for %s.\n", dev->auth->sessionid, old_sessionid, dev->get_mac().str().c_str());;
+            
             m_devices_pending[adr.mac] = dev;
         }
         else
@@ -4059,7 +4072,7 @@ public:
 
         dev->receiver_only = pkt->header.flags & SHZNET_PKT_FLAGS_RECEIVER_ONLY;
 
-        if(dev->auth.allocated() && dev->auth->resend_timer.update())
+        if(dev->auth->resend_timer.update())
             send_auth_req(dev);
 
         dev->auth->connect_guard.reset();
@@ -4072,13 +4085,30 @@ public:
             NETPRNT_FMT("auth invalid size %i : %i\n", pkt->get_data_size(), (int)sizeof(shznet_pkt_auth_reply));
             return;
         }
+
         shznet_adr adr(dev_ip.ip, pkt->source_mac(), dev_ip.port);
+
+        NETPRNT_FMT("[AUTH2] Auth reply from %s\n", adr.mac.str().c_str());
+
         auto active_dev = m_devices_pending.find(adr.mac);
 
         if (active_dev == m_devices_pending.end())
         {
-            NETPRNT_FMT("received invalid auth reply from %s test: %i\n", adr.mac.str().c_str(), (int)m_devices_pending.size());
-            return;
+            if (m_devices.find(adr.mac) != m_devices.end())
+                return;
+            if (m_devices_offline.find(adr.mac) != m_devices_offline.end())
+            {
+                NETPRNT("offline device to pending device");
+                m_devices_pending[adr.mac] = m_devices_offline[adr.mac];
+                m_devices_offline.erase(adr.mac);
+            }
+            else
+            {
+                NETPRNT_FMT("received invalid auth reply from %s test: %i\n", adr.mac.str().c_str(), (int)m_devices_pending.size());
+                m_devices_pending[adr.mac] = std::make_shared<shznet_device>(this, adr, "", "");
+            }
+
+            active_dev = m_devices_pending.find(adr.mac);
         }
 
         shznet_pkt_auth_reply* reply = (shznet_pkt_auth_reply*)pkt->get_data();
@@ -4304,6 +4334,15 @@ public:
     void send_auth_req(shznet_device_ptr dev)
     {
         shznet_pkt_auth_req req(dev->auth->sessionid);
+
+        memcpy(req.reply.name, m_nodename.c_str(), m_nodename.length());
+        req.reply.name[m_nodename.length()] = 0;
+
+        memcpy(req.reply.type, m_nodetype.c_str(), m_nodetype.length());
+        req.reply.type[m_nodetype.length()] = 0;
+
+        req.reply.max_parallel_queues = m_udp.max_parallel_queries();
+        req.reply.max_data_size = SHZNET_PKT_DATA_SIZE;
 
         NETPRNT_FMT("send auth request with id: %i to %s:%i %s test: %i\n", dev->auth->sessionid, dev->get_ip().str().c_str(), (int)dev->get_address().ip.port, dev->get_mac().str().c_str(), (int)m_devices_pending.size());
 
@@ -4642,7 +4681,7 @@ public:
                 size -= sizeof(uint32_t);
 
                 auto dev = find_device(hdr.macid_source);
-                if (dev )
+                if (dev)
                 {
                     handle_response_recv(dev, cmd_hash, hdr.ticketid, data, size, hdr.data_format);
                 }
@@ -5065,7 +5104,7 @@ public:
                 continue;
             }
             auto dev = find_device(it->get()->device);
-            if (dev && dev->connected)
+            if (dev /* && dev->connected*/)
             {
                 handle_response_recv(dev, it->get()->cmd, it->get()->id, it->get()->data.data(), it->get()->data.size(), it->get()->fmt);
                 it = m_pending_device_responds.erase(it);

@@ -877,19 +877,21 @@ struct shznet_pkt_diagnostic_request
 
 }PACKED_ATTR;
 
-struct shznet_pkt_auth_req
-{
-    shznet_sessionid sessionid;
-
-    shznet_pkt_auth_req(shznet_sessionid id) : sessionid(id) {}
-}PACKED_ATTR;
-
 struct shznet_pkt_auth_reply
 {
     char name[32] = { 0 };
     char type[64] = { 0 };
     int max_parallel_queues = SHZNET_PKT_MAX_QUEUES;
     int max_data_size = SHZNET_PKT_DATA_SIZE;
+}PACKED_ATTR;
+
+struct shznet_pkt_auth_req
+{
+    shznet_pkt_auth_reply reply; //A request from another server can also act as a registration on our side, 
+    //A bit complicated, like server A does a 3 way handshake, but server B really only needs the 2 initial request from server A to also register server A itself. 
+
+    shznet_sessionid sessionid;
+    shznet_pkt_auth_req(shznet_sessionid id) : sessionid(id) {}
 }PACKED_ATTR;
 
 struct shznet_command_defs
@@ -2835,7 +2837,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
 
         void handle_diagnostics_endpoint(shznet_pkt_diagnostic* diags, uint64_t timestamp_recv)
         {
-
+            NETPRNT("recv ack diag");
             m_needs_ack = false;
             m_force_ack = false;
 

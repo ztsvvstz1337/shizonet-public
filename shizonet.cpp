@@ -379,13 +379,29 @@ void shznet_artnet_device::send_art_universe(int universe, byte* data, int len)
     base->send_art_universe(get_ip(), universe, data, len);
 }
 
+
+#include <random>
+
+uint64_t getRandom64() {
+    static std::random_device rd;
+    static std::mt19937_64 gen(rd());
+    static std::uniform_int_distribution<uint64_t> dist;
+    return dist(gen);
+}
 shznet_sessionid shznet_global_s::get_new_sessionid()
 {
+    //UPDATE: instead of incremental sessionids, generate random sessionid and keep them alive for each device
+    auto rnd = getRandom64();
+    if (rnd == 0) rnd++;
+    return rnd;
+
+    /*
     static shznet_sessionid _id;
     _id++;
     while (_id == -1 || _id == 0)
         _id++;
     return _id;
+    */
 }
 shznet_ticketid shznet_global_s::get_new_ticketid()
 {

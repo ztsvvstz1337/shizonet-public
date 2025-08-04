@@ -479,10 +479,31 @@ public:
 
             async_commands.read();
             order_buffers_data.recycle(buff_data);
+
+            max_packets_cc++;
+
+#ifdef ARDUINO
+            if (max_packets_cc >= 32)
+                break;
+#else
+            if (max_packets_cc >= 1024)
+                break;
+#endif
         }
+
+        max_packets_cc = 0;
 
         while ((packet_data = m_udp.read_packet(packet_ip, &packet_len, &packet_recv_time)) != 0)
         {
+            max_packets_cc++;
+#ifdef ARDUINO
+            if (max_packets_cc >= 32)
+                break;
+#else
+            if (max_packets_cc >= 1024)
+                break;
+#endif
+
             bool is_artnet = false;
             if (packet_len <= MAX_BUFFER_ARTNET && packet_len >= 8)
             {
@@ -525,9 +546,6 @@ public:
 
             m_udp.flush_packet();
 
-            max_packets_cc++;
-            if (max_packets_cc > 1000)
-                break;
             packet_ip.port = 0;
         }
 
@@ -1887,7 +1905,6 @@ protected:
     shznet_timer        timeout;
     shznet_timer        offline_timeout;
     shznet_timer_exp    alive_timeout;
-    shznet_timer        reconnect_timer = shznet_timer(1000 * 10);
     bool                connected = false;
     bool                was_connected = false;
     uint32_t            max_packets_before_pacing = 0;
@@ -2133,6 +2150,7 @@ public:
         address = adr;
 
         network_measure_timer = shznet_millis();
+
     }
 
     ~shznet_device()
@@ -2211,8 +2229,6 @@ public:
         for (auto& it : send_finish_callbacks)
             it.second(false);
         send_finish_callbacks.clear();
-
-        reconnect_timer.reset();
     }
 
     bool valid() {
@@ -3456,6 +3472,7 @@ protected:
     std::vector < std::pair<shznet_mac, const char*>> m_pending_disconnect;
 
     std::vector<shznet_device_ptr> m_devices_temp;
+    std::vector < shznet_device*>  m_devices_temp_ptrs;
 
     artnet_poll     art_poll;
     artnet_sync     art_sync;
@@ -3480,7 +3497,7 @@ protected:
     {
     }
 
-    virtual void on_device_disconnect(shznet_device_ptr dev_info) 
+    virtual void on_device_disconnect(shznet_device_ptr dev_info, const char* reason) 
     {
         
     }
@@ -3509,7 +3526,7 @@ protected:
         {
             NETPRNT_FMT("%s device disconnected: %s (%s)\n", dev_info->type == SHZNET_DEV_ARTNET ? "artnet" : "shznet", dev_info->get_name().c_str(), dev_info->get_address().mac.str().c_str());
             if (reason) { NETPRNT_FMT("reason: %s\n", reason); }
-            on_device_disconnect(dev_info);
+            on_device_disconnect(dev_info, reason);
         }
     }
 
@@ -3874,18 +3891,24 @@ public:
 
         if (m_shizonet_enabled)
         {          
+            //This may look weird but is just for safety if the update()
+            //function somehow invalidates m_devices for whatever reason
+            m_devices_temp_ptrs.clear();
+            for (auto& it : m_devices)
+                m_devices_temp_ptrs.push_back(it.second.get());
+
             if (start_send_grp >= 0)
             {
-                for (auto& it : m_devices)
+                for (auto& it : m_devices_temp_ptrs)
                 {
                     for (int i = start_send_grp; i <= end_send_grp; i++)
-                        it.second->update(i);
+                        it->update(i);
                 }
             }
             else
             {
-                for (auto& it : m_devices)
-                    it.second->update(-1);
+                for (auto& it : m_devices_temp_ptrs)
+                    it->update(-1);
             }
 
             for (auto& it : m_devices_pending)
@@ -4032,13 +4055,6 @@ public:
             if (offline_dev != m_devices_offline.end())
             {
                 dev = offline_dev->second;
-                
-                //10 secs safety reconnect timer
-                if (!dev->reconnect_timer.update())
-                {
-                    NETPRNT_FMT("ignored auth reply due to reconnect timer %s.\n", dev->name.c_str());
-                    return;
-                }
                 dev->reset_offline_timeout();
                 m_devices_offline.erase(offline_dev);
             }
@@ -4901,11 +4917,6 @@ public:
             {
                 kvw.clear();
 
-                TaskHandle_t loopHandle = xTaskGetCurrentTaskHandle();
-                esp_task_wdt_delete(loopHandle);  // Unregister loopTask from watchdog
-
-                esp_task_wdt_deinit(); // Removes the watchdog from all tasks (global disable)
-
                 if (ota_update_handle != -1)
                 {
                     Serial.println("Closing old OTA handle.");
@@ -4947,16 +4958,6 @@ public:
 
                 Serial.print("Free heap size: ");
                 Serial.println(esp_get_free_heap_size());
-
-                esp_task_wdt_config_t config = {
-                    .timeout_ms = 30000, // 15 secs in milliseconds
-                    .idle_core_mask = (1 << xPortGetCoreID()), // Watch only the current core
-                    .trigger_panic = true // Enable panic so ESP32 restarts on timeout
-                };
-
-                esp_task_wdt_init(&config);
-                esp_task_wdt_add(0);
-                esp_task_wdt_reset();
 
                 kvw.add_int32("success", 1);
 
@@ -5008,7 +5009,7 @@ public:
         add_command_respond("ESP32_OTA_CHUNK", [this](std::shared_ptr<shznet_responder> responder)
             {
                 kvw.clear();
-                Serial.println("OTA CHUNK");
+                //Serial.println("OTA CHUNK");
                 auto err = esp_ota_write(ota_update_handle, responder->data(), responder->size());
                 if (err != ESP_OK)
                     kvw.add_int32("success", 0);              

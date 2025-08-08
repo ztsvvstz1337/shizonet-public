@@ -163,7 +163,13 @@ void shznet_device::send_fetch(std::shared_ptr<fetch_command_s> fetch_cmd)
 
     if (tid != INVALID_TICKETID)
     {
-        base->handle_response_add(shznet_base_impl::response_wait(tid, get_mac(), fetch_cmd->callback, 1000 * 10));
+        base->handle_response_add(shznet_base_impl::response_wait(tid, get_mac(), [this, fetch_cmd](byte* data, size_t size, shznet_pkt_dataformat fmt, bool success)
+            {
+                if (!success)
+                    fetch_commands.push_back(fetch_cmd);
+                else
+                    fetch_cmd->callback(data, size, fmt, success);
+            }, 1000 * 10));
 
         send_finished(tid, [this, tid, fetch_cmd](bool success)
             {

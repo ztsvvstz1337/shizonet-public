@@ -2106,7 +2106,7 @@ public:
 							longest_time = d;
 					}
 
-					obj->debug_log("The device has (%llu | %llu | %u) open orders (oldest is %llus). (err = %f, max = %f)", dev->get_ordered_buffers().size(), dev->get_unordered_buffers().size(), dev->num_zombie_buffers(), longest_time / 1000, dev->get_error_rate(), dev->get_packets_per_ms());
+					obj->debug_log("The device has (%llu | %llu | %u | wr:%u) open orders (oldest is %llus). (err = %f, max = %f)", dev->get_ordered_buffers().size(), dev->get_unordered_buffers().size(), dev->num_zombie_buffers(), (uint32_t)obj->m_wait_responses.size(), longest_time / 1000, dev->get_error_rate(), dev->get_packets_per_ms());
 				}
 
 				switch (dtype)

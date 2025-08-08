@@ -11,6 +11,8 @@
 #define __SHZNET_H__
 
 #include "shizonet_platform.h"
+#include <unordered_set>
+
 #define SHZNET_COMPAT_VERSION 14
 
 #ifdef ARDUINO_ARCH_ESP32
@@ -1627,6 +1629,8 @@ class shznet_base;
 
 
 #define SHZNET_RESPONSE_CMD                 "shznet_cmd"
+#define SHZNET_RESPONSE_CMD_CHECK           "shznet_cmd_check"
+#define SHZNET_RESPONSE_CMD_CHECK_ANSWER    "shznet_cmd_check_answer"
 #define SHZNET_RESPONSE_ACK_CMD_NOTFOUND    "shznet_response_ack_notfound"
 #define SHZNET_RESPONSE_ACK_CMD_SUCCESS     "shznet_response_ack_success"
 #define SHZNET_RESPONSE_ACK_CMD_FAIL        "shznet_response_ack_fail"
@@ -2229,6 +2233,8 @@ public:
         for (auto& it : send_finish_callbacks)
             it.second(false);
         send_finish_callbacks.clear();
+
+        _active_responses.clear();
     }
 
     bool valid() {
@@ -3111,6 +3117,8 @@ public:
 
     uint32_t _init_connection_attempts = 0;
 
+    std::unordered_set<shznet_ticketid> _active_responses;
+
 protected:
     int m_current_send_group = -1;
     int m_last_send_group = -1;
@@ -3458,8 +3466,9 @@ protected:
         shznet_response_callback cb;
         uint64_t timeout_start = 0;
         uint64_t timeout = 0;
+        uint64_t last_check = 0;
 
-        response_wait(shznet_ticketid _id, shznet_mac _dev, shznet_response_callback _cb, uint64_t _timeout = 0) : id(_id), dev(_dev), cb(_cb), timeout(_timeout) { if (timeout) timeout_start = shznet_millis(); };
+        response_wait(shznet_ticketid _id, shznet_mac _dev, shznet_response_callback _cb, uint64_t _timeout = 0) : id(_id), dev(_dev), cb(_cb), timeout(_timeout) { last_check = shznet_millis(); if (timeout) timeout_start = last_check; };
     };
 
     std::unordered_map<shznet_mac, shznet_artnet_device_ptr> m_artnet_devices;
@@ -3848,13 +3857,33 @@ public:
             uint64_t current_time = shznet_millis();
             for (auto it = m_wait_responses.begin(); it != m_wait_responses.end();)
             {
+                bool response_invalid = false;
+
                 if (it->timeout && current_time - it->timeout_start >= it->timeout)
+                    response_invalid = true;
+               
+                auto dev = m_devices.find(it->dev);
+                if (dev == m_devices.end())
+                    response_invalid = true;
+
+                if (response_invalid)
                 {
                     m_wait_responses_tmp.push_back(*it);
                     it = m_wait_responses.erase(it);
                 }
                 else
+                {
+                    //Last, periodically check if the order is still being processed on the other side (every 10 seconds)
+                    if (current_time - it->last_check >= (1000 * 10))
+                    {
+                        shznet_kv_writer writer;
+                        writer.add_int64("ticketid", it->id);
+                        dev->second->send_reliable(SHZNET_RESPONSE_CMD_CHECK, writer.get_buffer().data(), writer.get_buffer().size(), SHZNET_PKT_FMT_DATA, false);
+                        it->last_check = current_time;
+                    }
+
                     ++it;
+                }
             }
 
             for (auto it : m_wait_responses_tmp)
@@ -4469,7 +4498,9 @@ class shznet_responder
 
 public:
 
-    shznet_responder(shznet_device_ptr _dev, shznet_ticketid _id, byte* _data, size_t _size, shznet_pkt_dataformat _fmt) : _device(_dev), _id(_id), _data(_data), _size(_size), _fmt(_fmt) {}
+    shznet_responder(shznet_device_ptr _dev, shznet_ticketid _id, byte* _data, size_t _size, shznet_pkt_dataformat _fmt) : _device(_dev), _id(_id), _data(_data), _size(_size), _fmt(_fmt) { 
+        _dev->_active_responses.emplace(_id);
+    }
 
     void respond(byte* data, size_t size, shznet_pkt_dataformat fmt = SHZNET_PKT_FMT_DATA)
     {
@@ -4516,6 +4547,7 @@ public:
 
     ~shznet_responder()
     {
+        _device->_active_responses.erase(_id);
         if (!has_responded)
         {
             _device->send_response(SHZNET_RESPONSE_ACK_CMD_SUCCESS, _id, 0, 0, SHZNET_PKT_FMT_INVALID);
@@ -4716,6 +4748,56 @@ public:
                     send_shz_poll(dev_adr);
                 }
             });
+
+        add_command(SHZNET_RESPONSE_CMD_CHECK, [this](shznet_ip& ip, byte* data, size_t size, shznet_pkt_header& hdr)
+            {
+                shznet_kv_reader reader(data, size);
+
+                shznet_ticketid check_ticket_id = reader.read_int64("ticketid");
+
+                auto dev = find_device(hdr.macid_source);
+                if (dev)
+                {
+                    shznet_kv_writer writer;
+                    writer.add_int64("ticketid", check_ticket_id);
+                    writer.add_int32("result", dev->_active_responses.contains(check_ticket_id));
+                    dev->send_reliable(SHZNET_RESPONSE_CMD_CHECK_ANSWER, writer.get_buffer().data(), writer.get_buffer().size(), SHZNET_PKT_FMT_DATA, false, 0);
+                }
+                else
+                {
+                    shznet_adr dev_adr;
+                    dev_adr.ip = ip;
+                    dev_adr.mac = hdr.macid_source;
+                    send_shz_poll(dev_adr);
+                }
+            });
+
+        add_command(SHZNET_RESPONSE_CMD_CHECK_ANSWER, [this](shznet_ip& ip, byte* data, size_t size, shznet_pkt_header& hdr)
+            {
+                shznet_kv_reader reader(data, size);
+
+                shznet_ticketid check_ticket_id = reader.read_int64("ticketid");
+                bool result = reader.read_int32("result");
+
+                if (check_ticket_id && !result)
+                {
+                    auto dev = find_device(hdr.macid_source);
+                    if (dev)
+                    {
+                        for (auto it = m_wait_responses.begin(); it != m_wait_responses.end(); it++)
+                        {
+                            if (it->id == check_ticket_id && it->dev == dev->get_mac())
+                            {
+                                auto cb = it->cb;
+                                it = m_wait_responses.erase(it);
+                                if (cb) cb(0, 0, SHZNET_PKT_FMT_DATA, 0);
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
         add_command(SHZNET_RESPONSE_ACK_CMD_NOTFOUND, [this](shznet_ip& ip, byte* data, size_t size, shznet_pkt_header& hdr)
             {
                 if (size < sizeof(shznet_ticketid))
@@ -4735,7 +4817,7 @@ public:
                     if (it->id == id && it->dev == mac)
                     {
                         auto cb = it->cb;
-                        m_wait_responses.erase(it);
+                        it = m_wait_responses.erase(it);
                         cb(data, size, hdr.data_format, false);                     
                         break;
                     }
@@ -4764,7 +4846,7 @@ public:
                     if (it->id == id && it->dev == mac)
                     {
                         auto cb = it->cb;
-                        m_wait_responses.erase(it);
+                        it = m_wait_responses.erase(it);
                         cb(data, size, hdr.data_format, false);
                         break;
                     }
@@ -4791,7 +4873,7 @@ public:
                     if (it->id == id && it->dev == mac)
                     {
                         auto cb = it->cb;
-                        m_wait_responses.erase(it);
+                        it = m_wait_responses.erase(it);
                         cb(data, size, hdr.data_format, true);
                         break;
                     }
@@ -5152,7 +5234,7 @@ protected:
             if (it->id == tid)
             {
                 auto cb = it->cb;
-                m_wait_responses.erase(it);
+                it = m_wait_responses.erase(it);
                 if(cb) cb(0, 0, SHZNET_PKT_FMT_INVALID, 0);
                 break;
             }

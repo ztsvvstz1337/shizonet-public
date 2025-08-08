@@ -20,6 +20,7 @@
 #include <bitset>
 
 //#define SHIZONET_DEBUG
+//#define SHIZONET_EVENT_LOG
 
 #include "shizonet_platform_os.h"
 
@@ -69,6 +70,11 @@ namespace std
 #define NETPRNT_FMT(str,...)
 #define NETPRNT_ERR(str)
 #endif
+#ifdef SHIZONET_EVENT_LOG
+#define SHIZONETLOG(str,...) Serial.printf(str, __VA_ARGS__)
+#else
+#define SHIZONETLOG(str,...)
+#endif
 #define PACKED_ATTR __attribute__((packed))
 #else
 
@@ -82,6 +88,11 @@ namespace std
 #define NETPRNT(str)
 #define NETPRNT_FMT(str,...)
 #define NETPRNT_ERR(str)
+#endif
+#ifdef SHIZONET_EVENT_LOG
+#define SHIZONETLOG(str,...) printf(str, __VA_ARGS__)
+#else
+#define SHIZONETLOG(str,...)
 #endif
 #define PACKED_ATTR
 #ifdef __linux__
@@ -394,6 +405,7 @@ enum shznet_pkt_flags : byte
     SHZNET_PKT_FLAGS_UNRELIABLE = 1,
     SHZNET_PKT_FLAGS_RECEIVER_ONLY = 2,
     SHZNET_PKT_FLAGS_STREAM_DATA = 4,
+    SHZNET_PKT_FLAGS_BROADCAST = 8
 };
 enum shznet_pkt_dataformat : byte
 {
@@ -533,6 +545,9 @@ struct shznet_pkt
 
     uint32_t packet_set_data(byte* _data, uint32_t size, uint64_t max_size = 0, uint64_t offset = 0) //returns how much of the data has fit into the packet (with cmd set etc)
     {
+        if (max_size == 0)
+            max_size = size;
+
         uint32_t max_pkt_size = SHZNET_PKT_DATA_SIZE;
         if (size + offset > max_pkt_size)
         {
@@ -540,6 +555,7 @@ struct shznet_pkt
             size = max_pkt_size - offset;
         }
         if(_data) memcpy(&data[offset], _data, size);
+
         header.data_max_size = max_size;
         header.data_size = size + offset;
 
@@ -559,6 +575,11 @@ struct shznet_pkt
     void packet_set_stream_flag() //this means if the endpoint on the other device doesnt exist, it shouldnt send a RESET_BUFFERS_REQ
     {
         header.flags |= SHZNET_PKT_FLAGS_STREAM_DATA;
+    }
+
+    void packet_set_broadcast()
+    {
+        header.flags |= SHZNET_PKT_FLAGS_BROADCAST;
     }
 
     void packet_set_format(shznet_pkt_dataformat fmt)

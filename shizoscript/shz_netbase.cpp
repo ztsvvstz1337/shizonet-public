@@ -369,14 +369,10 @@ class ShizoNetDevice : public shzobject_ext<ShizoNetDevice>
 
 	shznet_device_ptr m_device;
 
-	uint64_t current_uid = 0;
-
 public:
 	ShizoNetDevice(shznet_device_ptr dev = 0)
 	{
 		m_device = dev;
-		if(m_device)
-			current_uid = m_device->get_unique_id();
 	}
 	virtual ~ShizoNetDevice()
 	{
@@ -495,12 +491,12 @@ public:
 		scriptFunction("still_valid", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
 			{
 				if (!obj->m_device) { result.initInt(0);  return; }
-				result.initInt(obj->m_device->valid() && obj->m_device->get_unique_id() == obj->current_uid);
+				result.initInt(obj->m_device->valid());
 			}, 0, true, false, "() check if device is still online or if it is offline or has reconnected by the time (new session or invalid session)");
 		scriptFunction("online", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
 			{
 				if (!obj->m_device) { result.initInt(0);  return; }
-				result.initInt(obj->m_device->online() && obj->m_device->get_unique_id() == obj->current_uid);
+				result.initInt(obj->m_device->online());
 			}, 0, true, false, "() check if device is still online or if it is offline or has reconnected by the time (new session or invalid session)");
 
 		scriptFunction("send_fast", [](ShizoNetDevice* obj, shzblock* blk, shzvector<shzvar*>& params, shzvar& result)
@@ -1037,10 +1033,6 @@ public:
 	void set_device(shznet_device_ptr dev)
 	{
 		m_device = dev;
-		if (m_device)
-			current_uid = m_device->get_unique_id();
-		else
-			current_uid = 0;
 	}
 
 };

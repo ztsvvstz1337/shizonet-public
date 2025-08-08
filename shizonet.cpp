@@ -75,7 +75,14 @@ void shznet_device::clear_command_buffers()
 void shznet_device::clear_command_buffer(shznet_ticketid ticketid, bool cmd_failed, bool check_responses)
 {
     if (cmd_failed)
+    {
+        SHIZONETLOG("%s command failed.\n", get_mac().str().c_str());
         handle_response_failed(ticketid);
+    }
+    else
+    {
+        SHIZONETLOG("%s command executed.\n", get_mac().str().c_str());
+    }
 
     if (zombie_buffers.size() && zombie_buffers.front()->ticketid == ticketid)
     {
@@ -142,6 +149,10 @@ shznet_ticketid shznet_device::send_get(const char* cmd, byte* data, size_t size
                     base->handle_response_failed(tid);
                 }
             });
+    }
+    else
+    {
+        SHIZONETLOG("Cannot send get request to %s.\n", get_name().c_str());
     }
 
     return tid;

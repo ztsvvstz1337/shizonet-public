@@ -20,7 +20,7 @@
 #include <bitset>
 
 //#define SHIZONET_DEBUG
-//#define SHIZONET_EVENT_LOG
+#define SHIZONET_EVENT_LOG
 
 #include "shizonet_platform_os.h"
 
@@ -1304,11 +1304,11 @@ public:
 
     T* get()
     {
-#if !defined(ARDUINO)
-        std::unique_lock<std::mutex> _grd{ m_lock };
-#endif
         if (m_garbage.size())
         {
+#if !defined(ARDUINO)
+            std::unique_lock<std::mutex> _grd{ m_lock };
+#endif
             T* result = m_garbage.back();
             m_garbage.pop_back();
             return result;
@@ -1445,7 +1445,7 @@ public:
     //read data of next buffer but DO NOT mark it as free yet!
     char* read_peek(int32_t* max_len = 0, BufferMarkerHeader* header_data = 0)
     {
-        if(max_len)
+        if (max_len)
             *max_len = 0;
         //pre read check
         if (m_missed_chunks)
@@ -1593,7 +1593,7 @@ public:
             if (!buf.start.is_valid)
                 return 0;
 
-            if (header_data) memcpy(header_data, &buf.start.header, sizeof(BufferMarkerHeader));          
+            if (header_data) memcpy(header_data, &buf.start.header, sizeof(BufferMarkerHeader));
             if (max_len) *max_len = buf.start.size;
 
             buf.start.is_valid = 0;
@@ -1608,13 +1608,48 @@ public:
         if (!mark->is_valid)
             return 0;
 
-        if(header_data) memcpy(header_data, &mark->header, sizeof(BufferMarkerHeader));
+        if (header_data) memcpy(header_data, &mark->header, sizeof(BufferMarkerHeader));
         if (max_len) *max_len = mark->size;
 
         mark->is_valid = 0;
         m_read_part_index += sizeof(BufferMarker) + mark->size;
 
         return mark_data;
+    }
+};
+
+template<const int _BUFF_SIZE, const int _BUFF_MAX, class BufferMarkerHeader> class shznet_async_buffer_mpsc
+{
+    shznet_async_buffer<_BUFF_SIZE, _BUFF_MAX, BufferMarkerHeader> inner;
+
+    std::mutex lock;
+
+public:
+
+    bool write(byte* data, int32_t size, BufferMarkerHeader* header_data = 0)
+    {
+        std::unique_lock _grd{ lock };
+        return inner.write(data, size, header_data);
+    }
+
+    bool empty()
+    {
+        return inner.empty();
+    }
+
+    //read data of next buffer but DO NOT mark it as free yet!
+    char* read_peek(int32_t* max_len = 0, BufferMarkerHeader* header_data = 0)
+    {
+        std::unique_lock _grd{ lock };
+        return inner.read_peek(max_len, header_data);
+    }
+
+    //this can be used to flush (free) a buffer peek'd by read_peek, its better to not use it directly as its not thread safe in case
+    //of a buffer overrun
+    char* read(int32_t* max_len = 0, BufferMarkerHeader* header_data = 0)
+    {
+        std::unique_lock _grd{ lock };
+        return inner.read(max_len, header_data);
     }
 };
 
@@ -1709,13 +1744,18 @@ protected:
     };
 
     shznet_timer m_sendbuffer_wait = shznet_timer(1);
-    shznet_async_buffer<SHZNET_PKT_MAX, SHZNET_PKT_MAX_ASYNC, shznet_ip> m_sendbuffer;
-    shznet_async_buffer<SHZNET_PKT_MAX, SHZNET_PKT_MAX_ASYNC, shznet_ip> m_sendbuffer_prio;
-    shznet_async_buffer<sizeof(shznet_pkt_diagnostic), SHZNET_PKT_MAX_ASYNC_DIAG, shznet_async_header> m_sendbuffer_diagnostic;
+    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, SHZNET_PKT_MAX_ASYNC, shznet_ip> m_sendbuffer;
+    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, SHZNET_PKT_MAX_ASYNC, shznet_ip> m_sendbuffer_prio;
+    shznet_async_buffer_mpsc<sizeof(shznet_pkt_diagnostic), SHZNET_PKT_MAX_ASYNC_DIAG, shznet_async_header> m_sendbuffer_diagnostic;
 
     bool sendbuffer_queue_free()
     {
         return m_sendbuffer.empty() && m_sendbuffer_prio.empty() && m_sendbuffer_diagnostic.empty();
+    }
+
+    bool sendbuffer_prio_queue_free()
+    {
+        return m_sendbuffer_prio.empty() && m_sendbuffer_diagnostic.empty();
     }
 
     virtual void handle_diagnostics(shznet_ip& adr, shznet_pkt_diagnostic* diags) {}
@@ -1910,7 +1950,7 @@ public:
     }
     virtual bool send_buffered_prio(shznet_ip& info, unsigned char* buffer, int32_t len)
     {
-        if (sendbuffer_queue_free() && send_packet_prio(info, buffer, len))
+        if (sendbuffer_prio_queue_free() && send_packet_prio(info, buffer, len))
             return true;
 
         return m_sendbuffer_prio.write(buffer, len, &info);
@@ -2277,7 +2317,7 @@ public:
         }PACKED_ATTR;
 #pragma pack(pop)
 
-        shznet_async_buffer<SHZNET_PKT_MAX, MAX_ESP_BUFFERS, packet_buffer_header> m_asyncbuffer;
+        shznet_async_buffer_mpsc<SHZNET_PKT_MAX, MAX_ESP_BUFFERS, packet_buffer_header> m_asyncbuffer;
 
         AsyncUDP m_udp;
 
@@ -2367,7 +2407,6 @@ public:
             if (!len || !buffer)
                 return true;
             IPAddress tmp(info.ip[0], info.ip[1], info.ip[2], info.ip[3]);
-           
             auto res = m_udp.writeTo(buffer, len, tmp, info.port);
             
             //rausfinden was genau der sendet das es so langsam wird ??? woran hängt es?
@@ -2580,13 +2619,13 @@ class GenericOSUDPSocket : public GenericUDPSocket
         uint64_t recv_time;
     }PACKED_ATTR;
 
-    shznet_async_buffer<SHZNET_PKT_MAX, 1024*10, packet_buffer_header> m_asyncbuffer; //asyncrecv
-    shznet_async_buffer<SHZNET_PKT_MAX, 1024*10, shznet_ip> m_asyncsend;
-    shznet_async_buffer<SHZNET_PKT_MAX, 256, shznet_ip> m_asyncsend_artnet;
-    shznet_async_buffer<SHZNET_PKT_MAX, 256, shznet_ip> m_asyncsend_prio;
-    shznet_async_buffer<sizeof(shznet_pkt_diagnostic), 256, shznet_async_header> m_asyncsend_diagnostic;
+    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 1024*10, packet_buffer_header> m_asyncbuffer; //asyncrecv
+    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 1024*10, shznet_ip> m_asyncsend;
+    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 256, shznet_ip> m_asyncsend_artnet;
+    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 256, shznet_ip> m_asyncsend_prio;
+    shznet_async_buffer_mpsc<sizeof(shznet_pkt_diagnostic), 256, shznet_async_header> m_asyncsend_diagnostic;
 
-    shznet_async_buffer<sizeof(shznet_pkt_diagnostic), 256, shznet_async_header> m_async_diag_response;
+    shznet_async_buffer_mpsc<sizeof(shznet_pkt_diagnostic), 256, shznet_async_header> m_async_diag_response;
 
 
     volatile bool       m_threads_active = 1;
@@ -2766,6 +2805,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
         {
             m_socket = socket;
             m_adr = ip;
+            m_force_ack_timer.set_interval(2, 10);
         }
 
         bool try_send(byte* buffer, uint32_t size, send_pkt_priority prio, uint64_t recv_timestamp = 0)
@@ -2778,7 +2818,9 @@ class GenericOSUDPSocket : public GenericUDPSocket
                 if (send_with_prio(buffer, size, prio, recv_timestamp))
                     return true;
             }
-            //cannot send pkt yet, put it into the queue buffer...
+            //cannot send pkt yet, put it into the queue buffer..
+            
+            printf("Try_send new buffer!\n");
             return get_free_buffer(buffer, size, prio, recv_timestamp);
         }
 
@@ -2831,7 +2873,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
             {
                 NETPRNT("forcing ack...");
                 m_force_ack = true;
-                m_force_ack_timer.set_interval(1, 10);
+                m_force_ack_timer.set_interval(2, 10);
                 send_diag_req();
                 return !m_send_flush.empty();
             }
@@ -2927,28 +2969,6 @@ class GenericOSUDPSocket : public GenericUDPSocket
             //clear all send_flush buffers !!!
             //size of the buffer array doesnt matter just latency time
 
-            const int max_normal_pkts = 1024 * 10;
-            const int max_prio_pkts = max_normal_pkts + 10;
-
-            if (prio == SEND_PKT_PRIO)
-            {
-                if (m_buffer_count > max_prio_pkts)
-                {
-                    NETPRNT("network prio buffer overrun!");
-                    update_send();
-                    return false;
-                }
-            }
-            else
-            {
-                if (m_buffer_count > max_normal_pkts)
-                {
-                    NETPRNT("network normal buffer overrun!");
-                    update_send();
-                    return false;
-                }
-            }
-
             std::vector<byte>* res = 0;
             if (m_socket->m_send_endpoint_free_buffers.size() == 0)
             {
@@ -2960,25 +2980,11 @@ class GenericOSUDPSocket : public GenericUDPSocket
                 m_socket->m_send_endpoint_free_buffers.pop_back();
             }
 
-            if (m_send_flush.size() > m_buffer_safety)
+            if (m_send_flush.size() && m_send_flush.back().buffer->size() == size)
             {
-                m_buffer_safety_counter++;
-                if (m_buffer_safety_counter > 3)
-                {
-                    if (m_send_flush.back().buffer->size() == size && memcmp(m_send_flush.back().buffer->data(), data, size) == 0)
-                    {
-                        //NETPRNT("double packet detected, skipping...");
-                        return true;
-                    }
-
-                    //NETPRNT("warning, send buffer increase detected!");
-                    set_pkt_delay(m_pkt_delay + 10.0);
-                    update_send();
-                    return false;
-                }
+                if (memcmp(m_send_flush.back().buffer->data(), data, size) == 0)
+                    return true;
             }
-            else
-                m_buffer_safety_counter = 0;
 
             res->resize(size);
             memcpy(res->data(), data, size);
@@ -3109,8 +3115,9 @@ class GenericOSUDPSocket : public GenericUDPSocket
                 if (send_packet_to_interface(adr, (byte*)chunk, max_len))
                 {
                     m_asyncsend_artnet.read();
-                    continue;
                 }
+                else
+                    continue;
             }
 
             shznet_async_header adr_async;
@@ -3121,10 +3128,12 @@ class GenericOSUDPSocket : public GenericUDPSocket
                 if (send_loop_try_send(adr_async.ip, (byte*)chunk, max_len, SEND_PKT_DIAGNOSTIC, adr_async.timestamp_recv))
                 {
                     m_asyncsend_diagnostic.read();
+                }
+                else
+                {
+                    high_resolution_wait(wait_time);
                     continue;
                 }
-                high_resolution_wait(wait_time);
-                continue;
             }
             chunk = m_asyncsend_prio.read_peek(&max_len, &adr);
             if (chunk)
@@ -3133,10 +3142,12 @@ class GenericOSUDPSocket : public GenericUDPSocket
                 if (send_loop_try_send(adr, (byte*)chunk, max_len, SEND_PKT_PRIO))
                 {
                     m_asyncsend_prio.read();
+                }
+                else
+                {
+                    high_resolution_wait(wait_time);
                     continue;
                 }
-                high_resolution_wait(wait_time);
-                continue;
             }
             chunk = m_asyncsend.read_peek(&max_len, &adr);
             if (chunk)
@@ -3145,10 +3156,12 @@ class GenericOSUDPSocket : public GenericUDPSocket
                 if (send_loop_try_send(adr, (byte*)chunk, max_len, SEND_PKT_NORMAL))
                 {
                     m_asyncsend.read();                         
+                }
+                else
+                {
+                    high_resolution_wait(wait_time);
                     continue;
                 }
-                high_resolution_wait(wait_time);
-                continue;
             }
                
 #ifdef _WIN32
@@ -3357,6 +3370,7 @@ public:
     bool send_packet_prio(shznet_ip& info, unsigned char* buffer, int32_t len) override
     {         
         auto res = m_asyncsend_prio.write(buffer, len, &info);
+        m_sendflush = true;
         flush_send_buffer(true);
         return res;
     }

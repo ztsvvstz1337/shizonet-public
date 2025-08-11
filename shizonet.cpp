@@ -81,7 +81,7 @@ void shznet_device::clear_command_buffer(shznet_ticketid ticketid, bool cmd_fail
     }
     else
     {
-        SHIZONETLOG("%s command executed.\n", get_mac().str().c_str());
+        //SHIZONETLOG("%s command executed.\n", get_mac().str().c_str());
     }
 
     if (zombie_buffers.size() && zombie_buffers.front()->ticketid == ticketid)
@@ -409,7 +409,7 @@ shznet_sessionid shznet_global_s::get_new_sessionid()
 {
     //UPDATE: instead of incremental sessionids, generate random sessionid and keep them alive for each device
     auto rnd = getRandom64();
-    if (rnd == 0) rnd++;
+    while (rnd == 0 || rnd == -1) rnd++;
     return rnd;
 
     /*

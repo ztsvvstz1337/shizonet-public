@@ -15,6 +15,7 @@
 
 #define SHZNET_COMPAT_VERSION 14
 
+
 #ifdef ARDUINO_ARCH_ESP32
 //esp32 can have OSC support
 #define SHZNET_OSC_SUPPORT
@@ -47,7 +48,7 @@
                                             //is generally a bad idea, the only thing you can do is increase the payload on each packet to get more data thru
     #endif
 #else
-    #define SHZNET_MAX_RECV (-1)
+    #define SHZNET_MAX_RECV (1024 * 1024 * 128) //128MB max at once
     #define SHZNET_MAX_RECV_BUFFERS (-1)
     #define SHZNET_MAX_RECV_OOB (1024 * 1024) //1mb OOB data 
     #define SHZNET_PACKET_PACING_COUNT 0
@@ -130,7 +131,7 @@ struct shznet_order_buffer
             delete data;
     }
 
-    void reset()
+    void reset_buffer()
     {
         ticketid = -1;
         data_count = 0;
@@ -244,6 +245,8 @@ protected:
     shznet_pkt_big m_send_buffer_big;
     shznet_pkt_diagnostic_request m_send_diag;
 
+    std::mutex m_endpoint_mutex; //Not quite perfect but quick and dirty solution, somewhat find a better solution
+        //for a thread safe shared endpoint structure....
     std::unordered_map<shznet_mac, shznet_endpoint_s> m_endpoints;
     std::unordered_map<shznet_mac, shznet_stream_endpoint_s> m_stream_endpoints;
 
@@ -434,24 +437,27 @@ public:
                 expected_art_sync_time = shznet_millis();
             }
         }
+        {
+            std::unique_lock _endpointgrd{ m_endpoint_mutex };
 
-        for(auto it = m_endpoints.begin(); it != m_endpoints.end();)
-        {
-            if (it->second.timeout.update())
+            for (auto it = m_endpoints.begin(); it != m_endpoints.end();)
             {
-                it = m_endpoints.erase(it);
-                continue;
+                if (it->second.timeout.update())
+                {
+                    it = m_endpoints.erase(it);
+                    continue;
+                }
+                it++;
             }
-            it++;
-        }
-        for (auto it = m_stream_endpoints.begin(); it != m_stream_endpoints.end();)
-        {
-            if (it->second.timeout.update())
+            for (auto it = m_stream_endpoints.begin(); it != m_stream_endpoints.end();)
             {
-                it = m_stream_endpoints.erase(it);
-                continue;
+                if (it->second.timeout.update())
+                {
+                    it = m_stream_endpoints.erase(it);
+                    continue;
+                }
+                it++;
             }
-            it++;
         }
 
         m_udp.update();
@@ -597,9 +603,6 @@ public:
         case SHZNET_PKT_OOB:
             handle_shizonet_oob(adr, pkt);
             break;
-        case SHZNET_PKT_ALIVE_CHECK:
-            handle_shizonet_alive_check(adr, pkt);
-            break;
         case SHZNET_PKT_ALIVE_CHECK_REPL:
             handle_shizonet_alive_check_reply(adr, pkt);
             break;
@@ -622,6 +625,8 @@ public:
 
     virtual void handle_shizonet_oob(shznet_ip& adr, shznet_pkt* pkt)
     {
+        std::unique_lock _endpointgrd{ m_endpoint_mutex };
+
         shznet_mac target_mac(pkt->source_mac());
         auto endpoint = m_endpoints.find(target_mac);
         if (endpoint == m_endpoints.end())
@@ -730,6 +735,8 @@ public:
 
     virtual void handle_shizonet_auth_beacon(shznet_ip& adr, shznet_pkt* pkt)
     {
+        std::unique_lock _endpointgrd{ m_endpoint_mutex };
+
         shznet_mac target_mac(pkt->source_mac());
         NETPRNT_FMT("auth beacon(1) from: %s (%s:%i)\n", target_mac.str().c_str(), adr.str().c_str(), adr.port);
         auto endpoint = m_endpoints.find(target_mac);
@@ -743,7 +750,7 @@ public:
         m_send_buffer.packet_begin(SHZNET_PKT_AUTH_BEACON_REPLY, get_udp().local_adr().mac, target_mac, 0, sessid);
         m_send_buffer.header.flags = SHZNET_PKT_FLAGS_RECEIVER_ONLY;
         uint32_t pkt_size = m_send_buffer.packet_end();
-        m_udp.send_buffered_prio(adr, (uint8_t*)&m_send_buffer, pkt_size);
+        m_udp.send_buffered(adr, (uint8_t*)&m_send_buffer, pkt_size);
     }
 
     virtual void handle_shizonet_auth_beacon_reply(shznet_ip& adr, shznet_pkt* pkt) {};
@@ -758,6 +765,8 @@ public:
 
         //NETPRNT("auth request!");
 
+        std::unique_lock _endpointgrd{ m_endpoint_mutex };
+
         shznet_pkt_auth_req* req = (shznet_pkt_auth_req*)pkt->get_data();
 
         shznet_mac target_mac(pkt->source_mac());
@@ -766,11 +775,11 @@ public:
         auto& endpoint = m_endpoints[target_mac];
         endpoint.reset();
 
-        if (endpoint.sessionid != req->sessionid && found_endpoint)
+        if (!found_endpoint)
         {
-            //CLEAR ENDPOINT OPEN ORDERS HERE, DEVICE RECONNECTED !!!
-            NETPRNT("clear orders todo?");
+            endpoint.sessionid = pkt->header.sessionid;
         }
+
         NETPRNT_FMT("auth request new sessionid: %llu for %s : %i.\n", req->sessionid, target_mac.str().c_str(), (int)adr.port);
         endpoint.sessionid = req->sessionid;
 
@@ -796,7 +805,7 @@ public:
         m_send_buffer.packet_begin(SHZNET_PKT_AUTH_REPL, get_udp().local_adr().mac, target_mac, 0, endpoint.sessionid);
         m_send_buffer.packet_set_data<shznet_pkt_auth_reply>(repl);
         uint32_t pkt_size = m_send_buffer.packet_end();
-        m_udp.send_buffered_prio(adr, (uint8_t*)&m_send_buffer, pkt_size);
+        m_udp.send_buffered(adr, (uint8_t*)&m_send_buffer, pkt_size);
         endpoint.reset_timeout();
     }
 
@@ -981,7 +990,7 @@ public:
         uint32_t cmd;
     };
 
-    shznet_async_buffer<sizeof(shznet_order_buffer_data*), MAX_ASYNC_ORDER_BUFFERS, command_async_header> async_commands;
+    shznet_async_buffer_mpsc<sizeof(shznet_order_buffer_data*), MAX_ASYNC_ORDER_BUFFERS, command_async_header> async_commands;
     void push_generic_to_main_thread(shznet_ip& ip, shznet_pkt* pkt, shznet_order_buffer* buffer)
     {
         if (!buffer->data)
@@ -1006,8 +1015,8 @@ public:
             delay(1);
 #endif
         }
+
         buffer->data = 0;
-        
     }
 
     virtual void handle_shizonet_generic(shznet_ip& adr, shznet_pkt* pkt)
@@ -1019,9 +1028,12 @@ public:
 
         //CLEANUP
 
+        std::unique_lock _endpointgrd{ m_endpoint_mutex };
+
         if (m_order_check_flag)
         {
             m_order_check_flag = false;
+
             for (auto &it : m_endpoints)
             {
                 auto& orders = it.second.orders;
@@ -1032,7 +1044,7 @@ public:
                         NETPRNT("order buffer timeout!");
                         order_buffers_data.recycle(it->second->data);
                         it->second->data = 0;
-                        it->second->reset();
+                        it->second->reset_buffer();                        
                         order_buffers.recycle(it->second);
                         it = orders.erase(it);
                     }
@@ -1045,10 +1057,30 @@ public:
         shznet_mac target_mac(pkt->source_mac());
 
         auto ep = m_endpoints.find(target_mac);
-        if (ep != m_endpoints.end() && pkt->header.sessionid != ep->second.sessionid)
+        if (ep != m_endpoints.end())
         {
-            NETPRNT_FMT("invalid pkt received! %i : %i\n", pkt->header.sessionid, ep->second.sessionid);
-            SHIZONETLOG("Not handling generic because: %s\n", "invalid sessionid");
+            if (pkt->header.sessionid != -1 && pkt->header.sessionid != ep->second.sessionid)
+            {
+                NETPRNT_FMT("invalid pkt received! %i : %i\n", pkt->header.sessionid, ep->second.sessionid);
+                SHIZONETLOG("Not handling generic because: %s %i : %i\n", "invalid sessionid", pkt->header.sessionid, ep->second.sessionid);
+
+                shznet_pkt_ack ack;
+                ack.sessionid = pkt->header.sessionid;
+                ack.ticketid = pkt->header.ticketid;
+                memcpy(ack.mac, local_mac().mac, 6);
+                ack.type = shznet_ack_request_invalid_sessionid;
+                ack.missing_start_id = -1;
+                ack.missing_end_id = -1;
+                ack.make_checksum();
+                m_udp.send_buffered_prio(adr, (byte*)&ack, sizeof(shznet_pkt_ack));
+                if (ep != m_endpoints.end())
+                    m_endpoints.erase(ep);
+                return;
+            }
+        }
+        else
+        {
+            SHIZONETLOG("Not handling generic because: %s\n", "no endpoint");
 
             shznet_pkt_ack ack;
             ack.sessionid = pkt->header.sessionid;
@@ -1059,14 +1091,7 @@ public:
             ack.missing_end_id = -1;
             ack.make_checksum();
             m_udp.send_buffered_prio(adr, (byte*)&ack, sizeof(shznet_pkt_ack));
-            if (ep != m_endpoints.end())
-                m_endpoints.erase(ep);
             return;
-        }
-        else
-        {
-            m_endpoints[target_mac].sessionid == pkt->header.sessionid;
-            ep = m_endpoints.find(target_mac);
         }
 
         auto& orders = ep->second.orders;
@@ -1080,22 +1105,21 @@ public:
         {
             if (config.max_recv_buffers != (-1) && order_buffers.in_use() >= config.max_recv_buffers)
             {
-                NETPRNT("Max recv buffers reached!");
-                shznet_pkt_ack ack;
-                ack.sessionid = pkt->header.sessionid;
-                ack.ticketid = pkt->header.ticketid;
-                memcpy(ack.mac, local_mac().mac, 6);
-                ack.type = shznet_ack_request_busy;
-                ack.missing_start_id = -1;
-                ack.missing_end_id = -1;
-                ack.ack_id = 0;
-                ack.make_checksum();
-                m_udp.send_buffered_prio(adr, (byte*)&ack, sizeof(shznet_pkt_ack));
-                SHIZONETLOG("Not handling generic because: %s\n", "max recv buffers");
+                shznet_ticketid lowest_order = -1;
 
-                return;
+                for (auto it : orders)
+                {
+                    if (lowest_order == -1)
+                        lowest_order = it.first;
+                    else if (it.first < lowest_order)
+                        lowest_order = it.first;
+                }
+
+                orders.erase(lowest_order);
+
+                SHIZONETLOG("Max recv buffers. Erasing oldest %llu\n", lowest_order);
             }
-            else if (config.max_recv != (-1) && pkt->header.data_max_size > config.max_recv)
+            if ((config.max_recv != (-1) && pkt->header.data_max_size > config.max_recv) || pkt->header.data_max_size > SHZNET_MAX_RECV)
             {
                 NETPRNT("Max recv!");
                 shznet_pkt_ack ack;
@@ -1122,10 +1146,10 @@ public:
             {
                 NETPRNT("error: buff still has data?");
             }
-            else
-                buff->data = order_buffers_data.get();
+            buff->data = order_buffers_data.get();
             buff->last_id = 0;
             buff->complete = false;
+
             buff->data->resize(pkt->header.data_max_size);
             buff->data_per_pkt_size = pkt->header.data_size;
             if (pkt->header.seq_max && pkt->header.seq == pkt->header.seq_max) //handle 1 special case
@@ -1228,7 +1252,7 @@ public:
                 if (allTrue)
                 {
                     shznet_adr netadr(adr.ip, pkt->header.macid_source, adr.port);
-                    SHIZONETLOG("%s Generic packet received!\n", netadr.mac.str().c_str());
+                    //SHIZONETLOG("%s Generic packet received!\n", netadr.mac.str().c_str());
 
 
                     buff->complete = true;
@@ -1280,8 +1304,8 @@ public:
             {
                 NETPRNT("error: buff still has data?");
             }
-            else
-                buff->data = order_buffers_data.get();
+
+            buff->data = order_buffers_data.get();
             buff->last_id = 0;
             buff->complete = false;
             buff->data->resize(pkt->header.data_max_size);
@@ -1349,28 +1373,33 @@ public:
 
     virtual void handle_shizonet_ack_request(shznet_ip& adr, shznet_pkt_ack_request* pkt)
     {
+        std::unique_lock _endpointgrd{ m_endpoint_mutex };
+
         shznet_mac target_mac(pkt->mac);
 
         auto ep = m_endpoints.find(target_mac);
         if (ep == m_endpoints.end() || pkt->sessionid != ep->second.sessionid)
         {
-            SHIZONETLOG("Invalid ack from %s %ll %ll\n", target_mac.str().c_str(), ep->second.sessionid, pkt->sessionid);
+
+            if (ep != m_endpoints.end())
+            {
+                SHIZONETLOG("Invalid ack from %s %i %i\n", target_mac.str().c_str(), ep->second.sessionid, pkt->sessionid);
+            }
 
             NETPRNT("invalid ackreq pkt received!");
             shznet_pkt_ack ack;
 
-            ack.missing_start_id = -2;
-            ack.missing_end_id = -2;
+            ack.missing_start_id = -4;
+            ack.missing_end_id = -4;
                        
             ack.sessionid = pkt->sessionid;
             ack.ticketid = pkt->ticketid;
             memcpy(ack.mac, local_mac().mac, 6);
-            ack.type = pkt->type;
+            ack.type = shznet_ack_request_invalid_sessionid;
             ack.ack_id = pkt->ack_id;
             ack.make_checksum();
             m_udp.send_buffered_prio(adr, (byte*)&ack, sizeof(shznet_pkt_ack));
-            return;
-            
+            return;       
         }
 
         auto& orders = ep->second.orders;
@@ -1464,8 +1493,10 @@ public:
             {
                 order_buffers_data.recycle(entry->second->data);
                 entry->second->data = 0;
-                entry->second->reset();
+                entry->second->reset_buffer();
+                
                 order_buffers.recycle(entry->second);
+
                 orders.erase(entry);
                 //clear cmd buffer here
                 ack.missing_start_id = 0;
@@ -1491,6 +1522,8 @@ public:
 
     virtual void handle_shizonet_alive_check(shznet_ip& adr, shznet_pkt* pkt)
     {
+        std::unique_lock _endpointgrd{ m_endpoint_mutex };
+
         shznet_mac target_mac(pkt->source_mac());
         auto ep = m_endpoints.find(target_mac);
         shznet_sessionid sid = -1;
@@ -2185,6 +2218,7 @@ public:
 
         network_measure_timer = shznet_millis();
 
+        _init_test_timer.reset(0);
     }
 
     ~shznet_device()
@@ -2246,6 +2280,9 @@ public:
     }
 
     void set_invalid() {
+        _init_test = 0;
+        was_connected = 0;
+
         m_valid = false;
         m_alive_request = false;
         connected = false;
@@ -2670,8 +2707,19 @@ public:
         bool send_group_update = m_current_send_group != send_group;
         m_current_send_group = send_group;
 
+        uint32_t max_sends = 
+#ifdef ARDUINO
+            32;
+#else
+            1024;
+#endif
+
         while (keep_sending)
         {
+            max_sends--;
+            if (max_sends == 0)
+                break;
+
             keep_sending = false;
 
             if (zombie_buffers.size())
@@ -3156,6 +3204,8 @@ public:
     bool _has_shizoscript_json = false;
 
     uint32_t _init_connection_attempts = 0;
+    uint32_t _init_test = 0;
+    shznet_timer _init_test_timer = shznet_timer(1000 * 5);
 
     std::unordered_set<shznet_ticketid> _active_responses;
 
@@ -3559,6 +3609,13 @@ protected:
 
     void on_device_connect_internal(shznet_device_ptr dev_info)
     {
+        for (auto& it : check_device_connections)
+            if (it.get() == dev_info.get())
+                return;
+        for (auto& it : finalize_device_connections)
+            if (it.get() == dev_info.get())
+                return;      
+
         dev_info->was_connected = false;
         dev_info->_init_connection_attempts = 0;
         check_device_connections.push_back(dev_info);
@@ -3671,24 +3728,37 @@ public:
                 {
                     if (!dev_ptr->valid())
                         continue;
+
                     send_shz_poll(dev_ptr->get_address());
                     NETPRNT_FMT("testing device %s.\n", dev_ptr->get_name().c_str());
                     
+                    SHIZONETLOG("Testing: %s\n", dev_ptr->get_name().c_str());
+
                     uint32_t receive_cmd_defs = !is_client_only;
                     
                     auto tid = dev_ptr->send_get(
                         SHZNET_TEST_CMD,
                         (byte*)&receive_cmd_defs, sizeof(receive_cmd_defs),
                         SHZNET_PKT_FMT_INT32,
-                        [this, dev_ptr](byte* data, size_t size, shznet_pkt_dataformat fmt, bool success) {
+                        [this, dev_ptr, receive_cmd_defs](byte* data, size_t size, shznet_pkt_dataformat fmt, bool success) {
                             if (!success || !size) {
                                 //disconnect_device(dev_ptr->get_mac(), "init connection failed.");
                                 NETPRNT("init connection failed.");
+                                SHIZONETLOG("%s Init connection failed!\n", dev_ptr->get_name().c_str());
                                 if (dev_ptr->_init_connection_attempts < 3)
                                 {
                                     NETPRNT("retrying...");
-                                    check_device_connections.push_back(dev_ptr);
-                                    dev_ptr->_init_connection_attempts++;
+                                    bool fix_me = false;
+                                    for (auto& it : check_device_connections) {
+                                        if (it.get() == dev_ptr.get()) {
+                                            fix_me = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!fix_me) {
+                                        check_device_connections.push_back(dev_ptr);
+                                        dev_ptr->_init_connection_attempts++;
+                                    }
                                 }
                                 else
                                 {
@@ -3697,6 +3767,9 @@ public:
                                 }
                                 return;
                             }
+
+                            if (dev_ptr->was_connected)
+                                return;
 
                             dev_ptr->command_map.clear();
                             dev_ptr->command_response_map.clear();
@@ -3846,6 +3919,12 @@ public:
 
             for (auto it = m_devices.begin(); it != m_devices.end(); )
             {
+                if (it->second->_init_test == 1 && it->second->_init_test_timer.update())
+                {
+                    SHIZONETLOG("%s Resending init cmd...\n", it->second->get_name().c_str());
+                    it->second->send_reliable(SHZNET_TEST_INIT_CMD, 0, 0, SHZNET_PKT_FMT_DATA, false, 1000 * 5);
+                }
+
                 if (it->second->is_timeout())
                 {
                     if (it->second->m_alive_request)
@@ -3885,6 +3964,7 @@ public:
                 {
                     NETPRNT_FMT("shznet auth timeout: %s\n", it->second->get_name().c_str());
                     it->second->set_invalid();
+                    m_devices_offline[it->second->get_mac()] = it->second;
                     it = m_devices_pending.erase(it);
                 }
                 else
@@ -4026,8 +4106,7 @@ public:
     {
         NETPRNT_ERR("disconnect device!");
         NETPRNT_ERR(reason);
-        SHIZONETLOG("Disconnect %s because %s.\n", id.str().c_str(), reason);
-
+        
         shznet_device_ptr dev = 0;
         bool was_online = false;
         auto online_dev = m_devices.find(id);
@@ -4047,11 +4126,16 @@ public:
 
         if (dev)
         {
+            SHIZONETLOG("Disconnect %s because %s.\n", dev->get_name().c_str(), reason);
+
             m_devices_offline[id] = dev;
             if(was_online) this->on_device_disconnect_internal(dev, reason);
             dev->set_invalid();
             dev->reset_offline_timeout();
         }
+        else
+            SHIZONETLOG("Disconnect %s because %s.\n", id.str().c_str(), reason);
+
     }
 
     void handle_shizonet_alive_check_reply(shznet_ip& dev_ip, shznet_pkt* pkt) override
@@ -4067,21 +4151,23 @@ public:
 
     void handle_shizonet_auth_beacon(shznet_ip& adr, shznet_pkt* pkt) override
     {
+        std::unique_lock _endpointgrd{ m_endpoint_mutex };
+
         shznet_mac target_mac(pkt->source_mac());
-        //NETPRNT_FMT("auth beacon(2) from: %s (%s:%i)\n", target_mac.str().c_str(), adr.str().c_str(), adr.port);
-        auto endpoint = m_endpoints.find(target_mac);
         shznet_sessionid sessid = -1;
+
+        auto endpoint = m_endpoints.find(target_mac);
         if (endpoint != m_endpoints.end())
         {
             endpoint->second.reset_timeout();
             sessid = endpoint->second.sessionid;
         }
 
-        m_send_buffer.packet_begin(SHZNET_PKT_AUTH_BEACON_REPLY, get_udp().local_adr().mac, target_mac, 0, sessid);
-        uint32_t pkt_size = m_send_buffer.packet_end();
-        m_udp.send_buffered_prio(adr, (uint8_t*)&m_send_buffer, pkt_size);
-
         auto dev = m_devices.find(target_mac);
+
+        m_send_buffer.packet_begin(SHZNET_PKT_AUTH_BEACON_REPLY, get_udp().local_adr().mac, target_mac, dev == m_devices.end() ? 0 : dev->second->auth->sessionid, sessid);
+        uint32_t pkt_size = m_send_buffer.packet_end();
+        m_udp.send_buffered(adr, (uint8_t*)&m_send_buffer, pkt_size);
 
         shznet_adr test_adr;
         test_adr.mac = target_mac;
@@ -4090,7 +4176,7 @@ public:
         if (dev == m_devices.end())
         {
             SHIZONETLOG("Auth beacon %s received but the device is not registered!\n", target_mac.str().c_str());       
-            if(pkt->header.flags & SHZNET_PKT_FLAGS_BROADCAST || is_client_only) //If it was a broadcast send a poll, else dont to avoid ping-pong
+            if(pkt->header.flags & SHZNET_PKT_FLAGS_BROADCAST) //If it was a broadcast send a poll, else dont to avoid ping-pong
                 send_shz_poll(test_adr);
         }
         else
@@ -4098,41 +4184,52 @@ public:
             //SHIZONETLOG("Auth beacon %s received from known device!\n", target_mac.str().c_str());
             dev->second->reset_timeout();
 
-            if (pkt->header.flags & SHZNET_PKT_FLAGS_BROADCAST || is_client_only) //If it was a broadcast send a poll, else dont to avoid ping-pong
+            if (pkt->header.flags & SHZNET_PKT_FLAGS_BROADCAST) //If it was a broadcast send a poll, else dont to avoid ping-pong
                 send_shz_poll(test_adr);
         }
     }
 
     void handle_shizonet_auth_beacon_reply(shznet_ip& dev_ip, shznet_pkt* pkt) override
     {
+        std::unique_lock _endpointgrd{ m_endpoint_mutex };
+
         shznet_adr adr(dev_ip.ip, pkt->source_mac(), dev_ip.port);
 
-        auto active_dev = m_devices.find(adr.mac);
-        if (active_dev != m_devices.end())
+        if (m_endpoints.find(adr.mac) == m_endpoints.end())
         {
-            active_dev->second->reset_timeout();
-            active_dev->second->update_address(adr);
-
-            active_dev->second->receiver_only = pkt->header.flags & SHZNET_PKT_FLAGS_RECEIVER_ONLY;
-            //SHIZONETLOG("Auth repl sessionid %llu\n", pkt->header.sessionid);
-
-            if (active_dev->second->auth->last_valid_sessionid == -1)
-            {
-                if (pkt->header.sessionid != -1)
-                    active_dev->second->auth->last_valid_sessionid = pkt->header.sessionid;
-            }
-            else
-            {
-                if (pkt->header.sessionid != active_dev->second->auth->last_valid_sessionid)
-                {                   
-                    SHIZONETLOG("Connect guard: %llu -> %llu\n", active_dev->second->auth->last_valid_sessionid, pkt->header.sessionid);
-                    active_dev->second->auth->last_valid_sessionid = -1;
-                    disconnect_device(active_dev->second->get_mac(), "connect_guard invalid sessionid.");
-                }
-            }
-
-            return;
+            m_endpoints[adr.mac].sessionid = pkt->header.ticketid; //Misusing this field here
+            m_endpoints[adr.mac].reset_timeout();
         }
+
+        {
+            auto active_dev = m_devices.find(adr.mac);
+            if (active_dev != m_devices.end())
+            {
+                active_dev->second->reset_timeout();
+                active_dev->second->update_address(adr);
+
+                active_dev->second->receiver_only = pkt->header.flags & SHZNET_PKT_FLAGS_RECEIVER_ONLY;
+
+                if (active_dev->second->auth->last_valid_sessionid == -1)
+                {
+                    if (pkt->header.sessionid != -1)
+                        active_dev->second->auth->last_valid_sessionid = pkt->header.sessionid;
+                }
+                else
+                {
+                    if (pkt->header.sessionid != active_dev->second->auth->last_valid_sessionid)
+                    {
+                        SHIZONETLOG("Connect guard: %llu -> %llu\n", active_dev->second->auth->last_valid_sessionid, pkt->header.sessionid);
+                        active_dev->second->auth->last_valid_sessionid = -1;
+                        disconnect_device(active_dev->second->get_mac(), "connect_guard invalid sessionid.");
+                    }
+                }
+
+                return;
+            }
+        }
+
+        SHIZONETLOG("Auth repl new device sessionid %llu\n", pkt->header.sessionid);
 
         NETPRNT_FMT("[AUTH1] Beacon reply from %s\n", adr.mac.str().c_str());
 
@@ -4231,8 +4328,7 @@ public:
                 dev->auth->state = SHZNET_AUTH_SUCCESS;
                 return;
             }
-
-            if (m_devices_offline.find(adr.mac) != m_devices_offline.end())
+            else if (m_devices_offline.find(adr.mac) != m_devices_offline.end())
             {
                 SHIZONETLOG("Auth req repl %s from offline device.\n", adr.mac.str().c_str());
                 NETPRNT("offline device to pending device");
@@ -4266,17 +4362,22 @@ public:
         NETPRNT("accepted pending device.");
 
         //Now, make sure that we as device are also registered on the remote endpoint before actually connecting
-        SHIZONETLOG("Auth req repl %s send init test.\n", adr.mac.str().c_str());
+        SHIZONETLOG("%s [LOCAL] send init test.\n", adr.mac.str().c_str());
         
-        auto init_tid = active_dev->second->send_reliable(SHZNET_TEST_INIT_CMD, 0, 0, SHZNET_PKT_FMT_DATA, false);
+        auto init_tid = active_dev->second->send_reliable(SHZNET_TEST_INIT_CMD, 0, 0, SHZNET_PKT_FMT_DATA, false, 1000 * 5);
+
         if (init_tid != -1)
         {
+            active_dev->second->_init_test = 1;
+            active_dev->second->_init_test_timer.reset();
+
             m_devices[adr.mac] = active_dev->second;
             m_devices_pending.erase(active_dev);
         }
         else
         {
             SHIZONETLOG("Auth req repl %s send init test failed!\n", adr.mac.str().c_str());
+            disconnect_device(adr.mac, "auth req reply send init failed.");
         }
     }
 
@@ -4311,7 +4412,7 @@ public:
     {
         m_send_buffer.packet_begin(SHZNET_PKT_ALIVE_CHECK, get_udp().local_adr().mac, adr.mac);
         uint32_t pkt_size = m_send_buffer.packet_end();
-        m_udp.send_buffered_prio(adr.ip, (uint8_t*)&m_send_buffer, pkt_size);
+        m_udp.send_buffered(adr.ip, (uint8_t*)&m_send_buffer, pkt_size);
     }
 
     void handle_artnet_reply(shznet_ip& adr, artnet_poll_reply* poll_reply) override
@@ -4468,7 +4569,7 @@ public:
         m_send_buffer.packet_begin(SHZNET_PKT_AUTH_BEACON, get_udp().local_adr().mac, adr.mac);
         if (is_broadcast) m_send_buffer.packet_set_broadcast();
         uint32_t pkt_size = m_send_buffer.packet_end();
-        m_udp.send_buffered_prio(adr.ip, (uint8_t*)&m_send_buffer, pkt_size);
+        m_udp.send_buffered(adr.ip, (uint8_t*)&m_send_buffer, pkt_size);
     }
 
     void send_art_universe(shznet_ip& adr, int universe, byte* data, int len)
@@ -4505,7 +4606,7 @@ public:
         m_send_buffer.packet_begin(SHZNET_PKT_AUTH_REQ, get_udp().local_adr().mac, dev->get_mac());
         m_send_buffer.packet_set_data<shznet_pkt_auth_req>(req);
         uint32_t pkt_size = m_send_buffer.packet_end();
-        m_udp.send_buffered_prio(dev->get_ip(), (uint8_t*)&m_send_buffer, pkt_size);
+        m_udp.send_buffered(dev->get_ip(), (uint8_t*)&m_send_buffer, pkt_size);
     }
 
     bool send_stream_broadcast(const char* cmd, byte* data, size_t size, shznet_pkt_dataformat fmt = SHZNET_PKT_FMT_DATA)
@@ -4585,7 +4686,6 @@ public:
 
 //TODO: should it work someday, merge it back with the shznet_base_impl class directly
 //this is just here to divide base network impl and command-response stuff
-
 class shznet_responder
 {
     shznet_device_ptr _device;
@@ -4768,7 +4868,7 @@ public:
 
                 shznet_adr adr(ip.ip, hdr.macid_source, ip.port);
 
-                SHIZONETLOG("%s init command!\n", adr.mac.str().c_str());
+                SHIZONETLOG("%s [REMOTE] init command!\n", adr.mac.str().c_str());
 
                 if (!dev)
                 {
@@ -4788,17 +4888,23 @@ public:
 
                     m_devices[hdr.macid_source] = dev;
 
+                    std::unique_lock _endpointgrd{ m_endpoint_mutex };
+
+                    m_endpoints[adr.mac].reset();
+                    m_endpoints[adr.mac].sessionid = hdr.sessionid;
+
                     dev->update_address(adr);
+                    dev->m_valid = true;
 
-                    dev->send_reliable(SHZNET_TEST_INIT_CMD, 0, 0, SHZNET_PKT_FMT_DATA, false);
+                    dev->send_reliable(SHZNET_TEST_INIT_CMD, 0, 0, SHZNET_PKT_FMT_DATA, false, 1000 * 5);
 
-                    SHIZONETLOG("%s forcing new device & send cmd.\n", adr.mac.str().c_str());
+                    SHIZONETLOG("%s [REMOTE] forcing new device & send cmd.\n", adr.mac.str().c_str());
                 }
 
                 dev->update_address(adr);
                 dev->reconnect_device(adr);
 
-                SHIZONETLOG("%s send init response.\n", adr.mac.str().c_str());
+                SHIZONETLOG("%s [REMOTE] send init response.\n", adr.mac.str().c_str());
                 dev->send_reliable(SHZNET_TEST_INIT_CMD_RESPONSE, 0, 0, SHZNET_PKT_FMT_DATA, false);
             });
 
@@ -4807,15 +4913,16 @@ public:
                 auto dev = find_device(hdr.macid_source);
                 shznet_adr adr(ip.ip, hdr.macid_source, ip.port);
 
-                SHIZONETLOG("%s init command response!\n", adr.mac.str().c_str());
-
+                
                 if (dev)
                 {
+                    SHIZONETLOG("%s [LOCAL] %s init command response!\n", adr.mac.str().c_str(), dev->get_name().c_str());
+                    dev->_init_test = 0;
                     on_device_connect_internal(dev);
                 }
                 else
                 {
-                    SHIZONETLOG("%s This should never happen.", adr.mac.str().c_str());
+                    SHIZONETLOG("%s This should never happen.\n", adr.mac.str().c_str());
                 }
             });
 
@@ -4896,7 +5003,7 @@ public:
                     return;
                 }
                
-                SHIZONETLOG("%s test command response!\n", adr.mac.str().c_str());
+                //SHIZONETLOG("%s test command response!\n", adr.mac.str().c_str());
                 
                 uint32_t cmd_hash = *(uint32_t*)&data[0];
 

@@ -76,7 +76,7 @@ void shznet_device::clear_command_buffer(shznet_ticketid ticketid, bool cmd_fail
 {
     if (cmd_failed)
     {
-        SHIZONETLOG("%s command failed.\n", get_mac().str().c_str());
+        SHIZONETLOG("%s command failed.\n", get_name().c_str());
         handle_response_failed(ticketid);
     }
     else
@@ -339,7 +339,7 @@ void shznet_device::handle_ack(shznet_pkt_ack* pkt)
         }
         else if (pkt_failed)
         {
-            NETPRNT_ERR("cmd failed to execute on device!");
+            //SHIZONETLOG("cmd failed to execute on device.");
             clear_command_buffer(pkt->ticketid, true);
             return;
         }

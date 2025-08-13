@@ -20,7 +20,9 @@
 #include <bitset>
 
 //#define SHIZONET_DEBUG
-#define SHIZONET_EVENT_LOG
+//#ifndef ARDUINO
+//#define SHIZONET_EVENT_LOG
+//#endif
 
 #include "shizonet_platform_os.h"
 
@@ -109,8 +111,8 @@ namespace std
 #define ART_DMX_START 18
 
 typedef unsigned char byte;
-typedef unsigned int shznet_sessionid;
-typedef unsigned long long shznet_ticketid;
+typedef uint32_t shznet_sessionid;
+typedef uint64_t shznet_ticketid;
 
 void* shznet_malloc(size_t size);
 
@@ -468,37 +470,39 @@ struct shznet_pkt
     {
         if (pkt_size < SHZNET_PKT_HEADER_SIZE || pkt_size > (sizeof(shznet_pkt_header) + SHZNET_PKT_DATA_SIZE))
         {
-            NETPRNT("invalid size!");
+            SHIZONETLOG("invalid size %i!\n", (int)pkt_size);
             return false;
         }
         if (header.id[0] != 'S' || header.id[1] != 'H' || header.id[2] != 'Z')
         {
-            NETPRNT("invalid id!");
+            header.id[3] = 0;
+            SHIZONETLOG("invalid id %s!\n", header.id);
             return false;
         }
         if (header.type >= SHZNET_PKT_TYPE_MAX)
+        {
+            SHIZONETLOG("invalid size %i!\n", (int)pkt_size);
             return false;
-
+        }
         //no checksum check for streams, handle that later to save ressources
         if (!force_checksum && (header.type == SHZNET_PKT_STREAM || header.flags & SHZNET_PKT_FLAGS_STREAM_DATA))
+        {
             return true;
+        }
 
         uint32_t real_chksum = header.chksum;
         header.chksum = 0;
         if (shznet_hash((char*)&header, SHZNET_PKT_HEADER_SIZE) != real_chksum)
         {
-            NETPRNT("invalid checksum header");
+            SHIZONETLOG("invalid checksum header %u : %u!\n", shznet_hash((char*)&header, SHZNET_PKT_HEADER_SIZE), real_chksum);
             return false;
         }
+        header.chksum = real_chksum;
         if (!(header.flags & SHZNET_PKT_FLAGS_UNRELIABLE))
         {
             if (shznet_hash((char*)data, pkt_size - SHZNET_PKT_HEADER_SIZE) != header.data_chksum)
             {
-                NETPRNT("invalid checksum data");
-                NETPRNT_FMT("chskum: %i : %i\n", header.data_chksum, shznet_hash((char*)data, pkt_size - SHZNET_PKT_HEADER_SIZE));
-                NETPRNT_FMT("size: %i : %i\n", pkt_size, header.data_size + SHZNET_PKT_HEADER_SIZE);
-                NETPRNT_FMT("type: %i : %i\n", (int)header.type, (int)header.data_format);
-                NETPRNT_FMT("seq: %i : %i\n", (int)header.seq, (int)header.seq_max);
+                SHIZONETLOG("invalid checksum data %u : %u!\n", header.data_chksum, shznet_hash((char*)data));
                 return false;
             }
         }
@@ -546,7 +550,7 @@ struct shznet_pkt
     uint32_t packet_set_data(byte* _data, uint32_t size, uint64_t max_size = 0, uint64_t offset = 0) //returns how much of the data has fit into the packet (with cmd set etc)
     {
         if (max_size == 0)
-            max_size = size;
+            max_size = size + offset;
 
         uint32_t max_pkt_size = SHZNET_PKT_DATA_SIZE;
         if (size + offset > max_pkt_size)
@@ -1143,9 +1147,12 @@ public:
         start_time = shznet_millis() - _wait_time;
     }
 
-    void reset()
+    void reset(uint64_t st = -1)
     {
-        start_time = shznet_millis();
+        if (st == -1)
+            start_time = shznet_millis();
+        else
+            start_time = st;
     }
 
     bool update()
@@ -1628,7 +1635,7 @@ public:
 
     bool write(byte* data, int32_t size, BufferMarkerHeader* header_data = 0)
     {
-        std::unique_lock _grd{ lock };
+        //std::unique_lock _grd{ lock };
         return inner.write(data, size, header_data);
     }
 
@@ -1640,7 +1647,7 @@ public:
     //read data of next buffer but DO NOT mark it as free yet!
     char* read_peek(int32_t* max_len = 0, BufferMarkerHeader* header_data = 0)
     {
-        std::unique_lock _grd{ lock };
+        //std::unique_lock _grd{ lock };
         return inner.read_peek(max_len, header_data);
     }
 
@@ -1648,7 +1655,7 @@ public:
     //of a buffer overrun
     char* read(int32_t* max_len = 0, BufferMarkerHeader* header_data = 0)
     {
-        std::unique_lock _grd{ lock };
+        //std::unique_lock _grd{ lock };
         return inner.read(max_len, header_data);
     }
 };
@@ -1684,7 +1691,7 @@ protected:
             {
                 if (pkt->check_packet(size) && pkt->header.data_size <= SHZNET_PKT_DATA_SIZE && pkt->header.seq <= pkt->header.seq_max)
                     return pkt->header.type;
-                NETPRNT("invalid pkt");
+                SHIZONETLOG("%i invalid packet!\n", (int)pkt->header.type);
                 return SHZNET_PKT_INVALID;
             }
             return SHZNET_PKT_INVALID;
@@ -1901,6 +1908,10 @@ public:
     {
         return send_packet(info, buffer, len);
     }
+
+
+    //Low level interface, dont use
+    virtual bool send_packet_to_interface(shznet_ip& info, unsigned char* buffer, int32_t len) { return false; }
 
     virtual void update()
     {
@@ -2287,6 +2298,25 @@ public:
             return shznet_kv_reader();
         return shznet_kv_reader((byte*)kv_data, get_value_size());
     }
+
+    void debug_keys()
+    {
+#ifdef ARDUINO
+        index = 0;
+        while (read())
+        {
+            Serial.printf("KEY: %s\n", get_key());
+        }
+        index = 0;
+#else
+        index = 0;
+        while (read())
+        {
+            printf("KEY: %s\n", get_key());
+        }
+        index = 0;
+#endif
+    }
 };
 
 #ifdef ARDUINO_ARCH_ESP32
@@ -2376,6 +2406,7 @@ public:
             //pre read check
             if (missed_packets)
             {
+                Serial.println("\nMissed Packets!");
                 missed_packets = false;
             }
 
@@ -2433,6 +2464,8 @@ public:
 
             return res == len;
         }
+
+        bool send_packet_to_interface(shznet_ip& info, unsigned char* buffer, int32_t len) override { return send_packet(info,buffer,len); }
 
         void update() override
         {
@@ -2733,9 +2766,19 @@ class GenericOSUDPSocket : public GenericUDPSocket
             if (!can_send_packet_now())
                 return false;
 
-            if (m_diag_counter == 0 || m_force_ack)
+            if (m_force_ack)
             {
-                if (!send_diag_req() || m_force_ack)
+                if (m_force_ack_timer.update())
+                {
+                    send_diag_req();
+                }
+
+                return false;
+            }
+
+            if (m_diag_counter == 0)
+            {
+                if (!send_diag_req())
                     return false;
             }
 
@@ -2874,6 +2917,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
                 NETPRNT("forcing ack...");
                 m_force_ack = true;
                 m_force_ack_timer.set_interval(2, 10);
+                m_force_ack_timer.reset(0);
                 send_diag_req();
                 return !m_send_flush.empty();
             }
@@ -2964,6 +3008,13 @@ class GenericOSUDPSocket : public GenericUDPSocket
                 return true;
             }
 
+            if (m_send_flush.size() > 64)
+            {
+                free_buffer(m_send_flush.front().buffer);
+                m_send_flush.pop();
+                SHIZONETLOG("sendflush buffer overflow! %i\n", size);
+                return false;
+            }
 
             //TODO: if total latency from pushing into buffer to real sending is bigge than 5ms
             //clear all send_flush buffers !!!
@@ -3006,7 +3057,6 @@ class GenericOSUDPSocket : public GenericUDPSocket
 
         bool send_direct(byte* buffer, uint32_t len)
         {
-
             return m_socket->send_packet_to_interface(m_adr, buffer, len);
         }
     };
@@ -3226,25 +3276,6 @@ class GenericOSUDPSocket : public GenericUDPSocket
         m_recvloop_active = false;
     }
 
-    uint32_t m_send_fail_counter = 0;
-    bool send_packet_to_interface(shznet_ip& info, unsigned char* buffer, int32_t len)
-    {
-        ipinfo tmp;
-        memcpy(tmp.adr.ip, info.ip, 4);
-        tmp.port = info.port;
-        bool send_result = m_udp.sock_send(buffer, len, tmp) == len;
-        //experimental, try to give the network increasingly more time (might be bad due to more and more increasing buffers...)
-        //maybe at diagnostics to calculate real netrate vs what we're trying to send and give a warning
-        if (!send_result)
-        {
-            m_send_fail_counter++;
-            std::this_thread::sleep_for(std::chrono::milliseconds(m_send_fail_counter > 100 ? 100 : m_send_fail_counter));
-        }
-        else
-            m_send_fail_counter = 0;
-        return send_result;
-    }
-
     void handle_diagnostics(shznet_ip& adr, shznet_pkt_diagnostic* diags) override 
     {
         shznet_async_header hdr(adr, shznet_millis());
@@ -3268,6 +3299,8 @@ class GenericOSUDPSocket : public GenericUDPSocket
     void start_high_resolution_timer();
     void stop_high_resolution_timer();
     void high_resolution_wait(uint32_t microseconds);
+
+    uint32_t m_send_fail_counter = 0;
 
 public:
 
@@ -3359,6 +3392,24 @@ public:
     void flush_packet() override
     {
         m_asyncbuffer.read();
+    }
+
+    bool send_packet_to_interface(shznet_ip& info, unsigned char* buffer, int32_t len) override
+    {
+        ipinfo tmp;
+        memcpy(tmp.adr.ip, info.ip, 4);
+        tmp.port = info.port;
+        bool send_result = m_udp.sock_send(buffer, len, tmp) == len;
+        //experimental, try to give the network increasingly more time (might be bad due to more and more increasing buffers...)
+        //maybe at diagnostics to calculate real netrate vs what we're trying to send and give a warning
+        if (!send_result)
+        {
+            m_send_fail_counter++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(m_send_fail_counter > 100 ? 100 : m_send_fail_counter));
+        }
+        else
+            m_send_fail_counter = 0;
+        return send_result;
     }
 
     bool send_packet(shznet_ip& info, unsigned char* buffer, int32_t len) override

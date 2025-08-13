@@ -3529,7 +3529,7 @@ shz_module_loader loader_netbase([](shzscript* s)
 #ifdef ARDUINO
 shznet_server* shz_netbase_create(shzscript* s, std::function<bool(const char*)> run_script_cb)
 {
-	ShizoNetBase::global_base = new ShizoNetBase(s, "DEFAULT", ART_NET_PORT);
+	ShizoNetBase::global_base = new ShizoNetBase(s, "ARDUINO", ART_NET_PORT);
 	s->register_update(shzptr<shzobject>(ShizoNetBase::global_base));
 	s->register_update_flush(shzptr<shzobject>(ShizoNetBase::global_base));
 
@@ -3549,7 +3549,7 @@ shznet_server* shz_netbase_create(shzscript* s, std::function<bool(const char*)>
 }
 shznet_client* shz_netclient_create(shzscript* s, std::function<bool(const char*)> run_script_cb)
 {
-	ShizoNetClient::global_client = new ShizoNetClient(s, "DEFAULT", ART_NET_PORT);
+	ShizoNetClient::global_client = new ShizoNetClient(s, "ARDUINO", ART_NET_PORT);
 	s->register_update(shzptr<shzobject>(ShizoNetClient::global_client));
 	s->register_update_flush(shzptr<shzobject>(ShizoNetClient::global_client));
 

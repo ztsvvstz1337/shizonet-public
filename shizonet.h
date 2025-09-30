@@ -33,12 +33,12 @@
 
 #ifdef ARDUINO_ARCH_ESP32
     #if defined(ESP_P4) || defined(ESP32_P4) //Stronger
-        #define SHZNET_MAX_RECV (1024 * 100) 
+        #define SHZNET_MAX_RECV (1024 * 1024) 
         #define SHZNET_MAX_RECV_BUFFERS (8) 
-        #define SHZNET_MAX_RECV_OOB (1024 * 50) 
+        #define SHZNET_MAX_RECV_OOB (1024 * 512) 
         #define SHZNET_PACKET_PACING_COUNT 8
     #else
-        #define SHZNET_MAX_RECV (1024 * 10) //10kb
+        #define SHZNET_MAX_RECV (1024 * 50) //50kb
         #define SHZNET_MAX_RECV_BUFFERS (4) //3 Buffers (~30kb)
         #define SHZNET_MAX_RECV_OOB (1024 * 10) //10kb OOB data 
         #define SHZNET_PACKET_PACING_COUNT 1 //Send X packets at once and then wait for the microcontroller to process them before sending more
@@ -838,7 +838,7 @@ public:
 
         if (opcode == ART_DMX)
         {
-            last_buffer_update.update();
+            last_buffer_update.reset();
 
             sequence = artnetPacket[12];
             incomingUniverse = artnetPacket[14] | artnetPacket[15] << 8;
@@ -1041,7 +1041,7 @@ public:
         //CLEANUP
 
         std::unique_lock _endpointgrd{ m_endpoint_mutex };
-        
+
         if (m_order_check_flag)
         {
             m_order_check_flag = false;
@@ -1402,8 +1402,22 @@ public:
         }
     }
 
+    //Testing
+    uint32_t ack_anti_spam = 0;
+    shznet_timer ack_anti_spam_timer = shznet_timer(10);
+
     virtual void handle_shizonet_ack_request(shznet_ip& adr, shznet_pkt_ack_request* pkt)
     {
+#ifdef ARDUINO
+        if (pkt->checksum == ack_anti_spam)
+        {
+            if (!ack_anti_spam_timer.update())
+                return;
+        }
+
+        ack_anti_spam = pkt->checksum;
+#endif
+
         std::unique_lock _endpointgrd{ m_endpoint_mutex };
 
         shznet_mac target_mac(pkt->mac);
@@ -5419,7 +5433,7 @@ public:
                 if (reader.get_fmt() != SHZNET_PKT_FMT_INT64)
                     return;
 
-                last_buffer_update.update();
+                last_buffer_update.reset();
 
                 //First item is the send index
                 uint64_t send_index = reader.get_value_type<uint64_t>();
@@ -5476,6 +5490,7 @@ public:
                     if (art_sync_timer.check() && art_frame_callback)
                     {
                         art_frame_callback(0);
+                        last_buffer_update.update();
                     }
                 }
             });
@@ -5681,7 +5696,7 @@ public:
 
     uint64_t is_receiving_data() //TODO: find better name and explanation, can be used to check wether we are receiving buffer updates or not
     {
-        return last_buffer_update.delay() < 1000 * 5;
+        return last_buffer_update.delay() < 1000 * 10;
     }
 
 #ifdef ARDUINO

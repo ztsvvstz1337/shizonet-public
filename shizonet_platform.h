@@ -1046,6 +1046,22 @@ public:
         return false;
     }
 
+    bool update_precise()
+    {
+        if (wait_time == 0)
+            return false;
+
+        uint64_t current_time = shznet_millis();
+        if (current_time >= start_time + wait_time)
+        {
+            auto delta = (current_time - (start_time + wait_time)) % (wait_time == 0 ? 1 : wait_time);
+            start_time = current_time - delta;
+            return true;
+        }
+
+        return false;
+    }
+
     bool update_period(bool get_all_updates = false)
     {
         if (wait_time == 0)

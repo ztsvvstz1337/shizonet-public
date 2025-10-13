@@ -390,10 +390,10 @@ void shznet_device::handle_response_failed(shznet_ticketid id)
     base->handle_response_failed(id);
 }
 
-void shznet_artnet_device::send_art_universe(int universe, byte* data, int len)
+void shznet_artnet_device::send_art_universe(int universe, byte* data, int len, uint8_t seq)
 {
     if (!base) return;
-    base->send_art_universe(get_ip(), universe, data, len);
+    base->send_art_universe(get_ip(), universe, data, len, seq);
 }
 
 

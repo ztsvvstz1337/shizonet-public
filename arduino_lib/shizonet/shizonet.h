@@ -3271,6 +3271,7 @@ class shznet_artnet_device
     {
         std::vector<byte> universe_buffer;
         bool			  dirty[16];
+        uint8_t           seq[16];
 
         artnet_buffer_s()
         {
@@ -3539,12 +3540,12 @@ public:
             if (artnet_buffer->dirty[idx])
             {
                 artnet_buffer->dirty[idx] = false;
-                send_art_universe(idx, &artnet_buffer->universe_buffer.data()[idx * 512], 512);
+                send_art_universe(idx, &artnet_buffer->universe_buffer.data()[idx * 512], 512, artnet_buffer->seq[idx]++);
             }
         }
     }
 
-    void send_art_universe(int universe, byte* data, int len);
+    void send_art_universe(int universe, byte* data, int len, uint8_t seq = 0);
 
     void update(int artnet_send_group)
     {
@@ -4809,10 +4810,11 @@ public:
             m_udp.send_buffered(adr.ip, (uint8_t*)&m_send_buffer, pkt_size);
     }
 
-    void send_art_universe(shznet_ip& adr, int universe, byte* data, int len)
+    void send_art_universe(shznet_ip& adr, uint16_t universe, byte* data, uint32_t len, uint8_t seq = 0)
     {
         art_dmx_buffer.universe = universe;
         art_dmx_buffer.length = len > 512 ? 512 : len;
+        art_dmx_buffer.seq = seq;
         memcpy(art_dmx_buffer.data, data, len);
         int total_size = ART_DMX_START + art_dmx_buffer.length;
         art_dmx_buffer.length = reverse_bits<short>(art_dmx_buffer.length);

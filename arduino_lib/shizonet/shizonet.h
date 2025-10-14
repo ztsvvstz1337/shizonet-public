@@ -3277,7 +3277,8 @@ class shznet_artnet_device
         {
             universe_buffer = std::vector<byte>(512 * 17); //+1 just in case someone buffer overruns
             memset(universe_buffer.data(), 0, universe_buffer.size());
-            memset(dirty, 1, 16);
+            memset(dirty, 0, 16);
+            memset(seq, 0, 16);
         }
     };
 

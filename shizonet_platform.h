@@ -19,10 +19,10 @@
 #include <memory>
 #include <bitset>
 
-//#define SHIZONET_DEBUG
-//#ifndef ARDUINO
-//#define SHIZONET_EVENT_LOG
-//#endif
+ //#define SHIZONET_DEBUG
+ //#ifndef ARDUINO
+ //#define SHIZONET_EVENT_LOG
+ //#endif
 
 #include "shizonet_platform_os.h"
 
@@ -468,7 +468,7 @@ struct shznet_pkt
 
     bool check_packet(uint32_t pkt_size, bool force_checksum = false) //memcpy recv buffer over this struct then call this function
     {
-        if (pkt_size < SHZNET_PKT_HEADER_SIZE || pkt_size > (sizeof(shznet_pkt_header) + SHZNET_PKT_DATA_SIZE))
+        if (pkt_size < SHZNET_PKT_HEADER_SIZE || pkt_size >(sizeof(shznet_pkt_header) + SHZNET_PKT_DATA_SIZE))
         {
             SHIZONETLOG("invalid size %i!\n", (int)pkt_size);
             return false;
@@ -558,7 +558,7 @@ struct shznet_pkt
             NETPRNT("warning: truncating packet data!");
             size = max_pkt_size - offset;
         }
-        if(_data) memcpy(&data[offset], _data, size);
+        if (_data) memcpy(&data[offset], _data, size);
 
         header.data_max_size = max_size;
         header.data_size = size + offset;
@@ -647,7 +647,7 @@ struct shznet_pkt_big
 
     bool check_packet(uint32_t pkt_size) //memcpy recv buffer over this struct then call this function
     {
-        if (pkt_size < SHZNET_PKT_HEADER_SIZE || pkt_size > (sizeof(shznet_pkt_header) + SHZNET_PKT_DATA_SIZE))
+        if (pkt_size < SHZNET_PKT_HEADER_SIZE || pkt_size >(sizeof(shznet_pkt_header) + SHZNET_PKT_DATA_SIZE))
         {
             return false;
         }
@@ -784,7 +784,7 @@ enum shznet_ack_request_type : uint16_t
     shznet_ack_request_ping,
     shznet_ack_request_quick_resend,
     shznet_ack_request_resend,
-    shznet_ack_request_busy, 
+    shznet_ack_request_busy,
     shznet_ack_request_too_big
 };
 
@@ -848,7 +848,7 @@ struct shznet_pkt_diagnostic
 {
     byte id[4] = { 'S','H','D', 0 };
     uint32_t diag_id = 0;
-    uint32_t packets_received = 0;  
+    uint32_t packets_received = 0;
     uint32_t checksum = 0;
     uint64_t timestamp = 0;
     uint64_t timestamp_remote = 0;
@@ -858,7 +858,7 @@ struct shznet_pkt_diagnostic
     {
         auto tmp_checksum = checksum;
         checksum = 0;
-        bool check = tmp_checksum == shznet_hash((char*)this,sizeof(shznet_pkt_diagnostic)) &&  (id[0] == 'S' && id[1] == 'H' && id[2] == 'D' && id[3] == 0);
+        bool check = tmp_checksum == shznet_hash((char*)this, sizeof(shznet_pkt_diagnostic)) && (id[0] == 'S' && id[1] == 'H' && id[2] == 'D' && id[3] == 0);
         checksum = tmp_checksum;
         return check;
     }
@@ -884,7 +884,7 @@ struct shznet_pkt_diagnostic_request
     uint32_t checksum = 0;
     shznet_pkt_diagnostic_request_type type = SHZNET_PKT_DIAG_REQ_DEFAULT; //if set, this is an emergency check because the original ack cmd did not seem to come through
     uint64_t timestamp = 0;
-    
+
     bool is_valid()
     {
         auto tmp_checksum = checksum;
@@ -1314,7 +1314,7 @@ public:
 #if defined(ARDUINO_ARCH_ESP32) || !defined(ARDUINO)
         std::unique_lock<std::mutex> _grd{ m_lock };
 #endif
-        
+
 #ifdef ARDUINO
         if (m_garbage.size() > 8)
         {
@@ -1676,6 +1676,103 @@ public:
     }
 };
 
+
+
+/*
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+
+template<const int _BUFF_SIZE, const int _BUFF_MAX, class BufferMarkerHeader>
+class shznet_async_buffer_mpsc
+{
+    struct Slot
+    {
+        std::atomic_int seq;  // sequence number (32-bit)
+        BufferMarkerHeader header;
+        int32_t size;
+        alignas(alignof(std::max_align_t)) char data[_BUFF_SIZE];
+    };
+
+    Slot m_slots[_BUFF_MAX];
+
+    std::atomic_int head{ 0 }; // producer claims
+    std::atomic_int tail{ 0 }; // consumer reads
+
+public:
+    shznet_async_buffer_mpsc()
+    {
+        for (int i = 0; i < _BUFF_MAX; ++i)
+            m_slots[i].seq.store(i, std::memory_order_relaxed);
+    }
+
+    // Multi-producer write
+    bool write(byte* data, int32_t size, BufferMarkerHeader* header_data = nullptr)
+    {
+        if (size <= 0 || size > _BUFF_SIZE)
+            return false;
+
+        uint32_t seq = head.fetch_add(1, std::memory_order_relaxed);
+        Slot& slot = m_slots[seq % _BUFF_MAX];
+
+        uint32_t expected = seq;
+        while (slot.seq.load(std::memory_order_acquire) != expected)
+        {
+            // busy wait; could yield if you want non-blocking
+        }
+
+        std::memcpy(slot.data, data, size);
+        slot.size = size;
+        if (header_data) slot.header = *header_data;
+
+        slot.seq.store(expected + 1, std::memory_order_release); // mark ready
+        return true;
+    }
+
+    // Consumer: peek without committing
+    char* read_peek(int32_t* max_len = nullptr, BufferMarkerHeader* header_data = nullptr)
+    {
+        uint32_t seq = tail.load(std::memory_order_relaxed);
+        Slot& slot = m_slots[seq % _BUFF_MAX];
+
+        if (slot.seq.load(std::memory_order_acquire) != seq + 1)
+            return nullptr;
+
+        if (max_len) *max_len = slot.size;
+        if (header_data) *header_data = slot.header;
+
+        return slot.data;
+    }
+
+    // Consumer: read and commit
+    char* read(int32_t* max_len = nullptr, BufferMarkerHeader* header_data = nullptr)
+    {
+        uint32_t seq = tail.load(std::memory_order_relaxed);
+        Slot& slot = m_slots[seq % _BUFF_MAX];
+
+        if (slot.seq.load(std::memory_order_acquire) != seq + 1)
+            return nullptr;
+
+        if (max_len) *max_len = slot.size;
+        if (header_data) *header_data = slot.header;
+
+        char* ptr = slot.data;
+
+        slot.seq.store(seq + _BUFF_MAX, std::memory_order_release); // free slot
+        tail.store(seq + 1, std::memory_order_relaxed);
+
+        return ptr;
+    }
+
+    bool empty()
+    {
+        uint32_t seq_head = head.load(std::memory_order_acquire);
+        uint32_t seq_tail = tail.load(std::memory_order_acquire);
+        return seq_tail == seq_head;
+    }
+};
+*/
+
 class GenericUDPSocket
 {
 protected:
@@ -1789,7 +1886,7 @@ protected:
         uint32_t last_id = 0;
         uint32_t packets_received = 0;
     };
-    
+
     //THIS MIGHT BE CALLED EXCLUSIVELY FROM THE RECV THREAD
     //the following fields & functions could be called from the recv thread on some platforms.
     shznet_timer m_diags_update = shznet_timer(1000 * 30);
@@ -1895,7 +1992,7 @@ public:
 
     GenericUDPSocket()
     {
-        
+
     }
 
     virtual ~GenericUDPSocket()
@@ -1906,9 +2003,9 @@ public:
     virtual bool init() = 0;
     virtual bool bind(int32_t port) = 0;
 
-	virtual char* read_packet(shznet_ip& info, int32_t* max_len, uint64_t* recv_time) = 0;
+    virtual char* read_packet(shznet_ip& info, int32_t* max_len, uint64_t* recv_time) = 0;
     virtual void flush_packet() = 0; //CALL THIS AFTER read_packet to release the last read packet !!!
-	virtual bool send_packet(shznet_ip& info, unsigned char* buffer, int32_t len) = 0;
+    virtual bool send_packet(shznet_ip& info, unsigned char* buffer, int32_t len) = 0;
     virtual bool send_packet_prio(shznet_ip& info, unsigned char* buffer, int32_t len) {
         return send_packet(info, buffer, len);
     }
@@ -1948,7 +2045,7 @@ public:
 
         shznet_ip adr;
 
-        while ((data = m_sendbuffer_prio.read_peek(&max_len,&adr)) != 0)
+        while ((data = m_sendbuffer_prio.read_peek(&max_len, &adr)) != 0)
         {
             if (!send_packet_prio(adr, (byte*)data, max_len))
             {
@@ -1991,7 +2088,7 @@ public:
     }
 
     //IMPORTANT DONT FORGET TO FILL MAC ADDRESS !!!
-	virtual shznet_adr& local_adr() = 0;
+    virtual shznet_adr& local_adr() = 0;
 
     virtual void flush_send_buffer(bool force = false) {};
 
@@ -2337,186 +2434,193 @@ public:
 
 #ifdef ARDUINO_ARCH_ESP32
 #if defined(ESP_ETH) || defined(ESP32_ETH)
-    //#include <Ethernet.h>
-    #include <ETH.h>
+//#include <Ethernet.h>
+#include <ETH.h>
 #endif
 
-    #include "WiFi.h"
-    #include "AsyncUDP.h"
+#include "WiFi.h"
+#include "AsyncUDP.h"
 
-    #include <chrono>
-    #include <mutex>
-    #include "esp_mac.h"
+#include <chrono>
+#include <mutex>
+#include "esp_mac.h"
 
-    #define MAX_ESP_BUFFERS 12
+#define MAX_ESP_BUFFERS 16
 
-    class GenericESPSocket : public GenericUDPSocket
-    {
+class GenericESPSocket : public GenericUDPSocket
+{
 
 #pragma pack(push, 1)
-        struct packet_buffer_header
-        {
-            volatile byte ip[4];
-            volatile uint64_t recv_time;
-            volatile int16_t port;
-            volatile bool is_broadcast;
-        }PACKED_ATTR;
+    struct packet_buffer_header
+    {
+        volatile byte ip[4];
+        volatile uint64_t recv_time;
+        volatile int16_t port;
+        volatile bool is_broadcast;
+    }PACKED_ATTR;
 #pragma pack(pop)
 
-        shznet_async_buffer_mpsc<SHZNET_PKT_MAX, MAX_ESP_BUFFERS, packet_buffer_header> m_asyncbuffer;
+    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, MAX_ESP_BUFFERS, packet_buffer_header> m_asyncbuffer;
 
-        AsyncUDP m_udp;
+    AsyncUDP m_udp;
 
-        bool missed_packets = false;
+    bool missed_packets = false;
 
-    public:
+public:
 
-        int max_parallel_queries() override
-        {
-            return 4;
-        }
+    int max_parallel_queries() override
+    {
+        return 4;
+    }
 
-        bool init() override
+    bool init() override
+    {
+        return true;
+    }
+
+    bool bind(int32_t port) override
+    {
+        m_localadr.ip.port = port;
+
+        m_udp.onPacket([this](AsyncUDPPacket& packet) {
+
+            auto rm_ip = packet.remoteIP();
+
+            packet_buffer_header header;
+            header.ip[0] = rm_ip[0];
+            header.ip[1] = rm_ip[1];
+            header.ip[2] = rm_ip[2];
+            header.ip[3] = rm_ip[3];
+            header.port = packet.remotePort();
+            header.is_broadcast = packet.isBroadcast();
+            header.recv_time = shznet_millis();
+            if (!m_asyncbuffer.write(packet.data(), packet.length(), &header))
+            {
+                //Serial.println("packet overflow!");
+                missed_packets = true;
+            }
+
+            });
+
+        if (m_udp.listen(port))
         {
             return true;
         }
 
-        bool bind(int32_t port) override
+        return false;
+    }
+
+    char* read_packet(shznet_ip& info, int32_t* max_len, uint64_t* recv_time) override
+    {
+        //pre read check
+        if (missed_packets)
         {
-            m_localadr.ip.port = port;
-            if (m_udp.listen(port))
-            {
-                m_udp.onPacket([this](AsyncUDPPacket &packet) {
-
-                    auto rm_ip = packet.remoteIP();
-                    shznet_ip rm_ip_shz(packet.remotePort());
-
-                    memcpy(&rm_ip_shz.ip[0], &rm_ip[0], 4);
-
-                    if (preprocess_packet(rm_ip_shz, packet.data(), packet.length()))
-                        return;
-
-                    packet_buffer_header header;
-                    header.ip[0] = rm_ip[0];
-                    header.ip[1] = rm_ip[1];
-                    header.ip[2] = rm_ip[2];
-                    header.ip[3] = rm_ip[3];
-                    header.port = packet.remotePort();
-                    header.is_broadcast = packet.isBroadcast();
-                    header.recv_time = shznet_millis();
-                    if (!m_asyncbuffer.write(packet.data(), packet.length(), &header))
-                    {
-                        //Serial.println("packet overflow!");
-                        missed_packets = true;
-                    }
-
-                    });
-                return true;
-            }
-
-            return false;
+            Serial.println("\nMissed Packets!");
+            missed_packets = false;
         }
 
-        char* read_packet(shznet_ip& info, int32_t* max_len, uint64_t* recv_time) override
+        packet_buffer_header header;
+
+        while (true)
         {
-            //pre read check
-            if (missed_packets)
-            {
-                Serial.println("\nMissed Packets!");
-                missed_packets = false;
-            }
-
-            packet_buffer_header header;
-
             auto data = m_asyncbuffer.read_peek(max_len, &header);
-
-            if (recv_time) *recv_time = header.recv_time;
 
             if (!data)
                 return 0;
 
+            if (recv_time) *recv_time = header.recv_time;
+
             memcpy(info.ip, (void*)&header.ip[0], 4);
             info.port = header.port;
+
+            if (preprocess_packet(info, (byte*)data, *max_len))
+            {
+                m_asyncbuffer.read();
+                continue;
+            }
 
             return data;
         }
 
-        void flush_packet() override
-        {
-            m_asyncbuffer.read();
-        }
+        return 0;
+    }
 
-        shznet_timer max_looper_timeout = shznet_timer(5000);
-        shznet_timer max_pps = shznet_timer(10);
-        uint32_t pps_current = 0;
-        bool send_packet(shznet_ip& info, unsigned char* buffer, int32_t len) override
+    void flush_packet() override
+    {
+        m_asyncbuffer.read();
+    }
+
+    shznet_timer max_looper_timeout = shznet_timer(5000);
+    shznet_timer max_pps = shznet_timer(10);
+    uint32_t pps_current = 0;
+    bool send_packet(shznet_ip& info, unsigned char* buffer, int32_t len) override
+    {
+        if (!len || !buffer)
+            return true;
+        IPAddress tmp(info.ip[0], info.ip[1], info.ip[2], info.ip[3]);
+        auto res = m_udp.writeTo(buffer, len, tmp, info.port);
+
+        //rausfinden was genau der sendet das es so langsam wird ??? woran hängt es?
+        /*
+        if (!max_pps.timeout())
         {
-            if (!len || !buffer)
-                return true;
-            IPAddress tmp(info.ip[0], info.ip[1], info.ip[2], info.ip[3]);
-            auto res = m_udp.writeTo(buffer, len, tmp, info.port);
-            
-            //rausfinden was genau der sendet das es so langsam wird ??? woran hängt es?
-            /*
-            if (!max_pps.timeout())
+            pps_current++;
+            if (pps_current > 10)
             {
-                pps_current++;
-                if (pps_current > 10)
-                {
-                    pps_current = 0;
-                    NETPRNT("send limit!");
-                    //NETPRNT_FMT("wifi tx buff: %i\n", WiFi.getTxBufferFree());
-                    vTaskDelay(100);
-                }
-            }
-            else
                 pps_current = 0;
-            */
-            if (res != len) 
-            { 
-                Serial.print("sendto failed!\n"); 
-                vTaskDelay(1);
+                NETPRNT("send limit!");
+                //NETPRNT_FMT("wifi tx buff: %i\n", WiFi.getTxBufferFree());
+                vTaskDelay(100);
             }
-
-            return res == len;
+        }
+        else
+            pps_current = 0;
+        */
+        if (res != len)
+        {
+            Serial.print("sendto failed!\n");
+            vTaskDelay(1);
         }
 
-        bool send_packet_to_interface(shznet_ip& info, unsigned char* buffer, int32_t len) override { return send_packet(info,buffer,len); }
+        return res == len;
+    }
 
-        void update() override
-        {
-            GenericUDPSocket::update();
-        }
+    bool send_packet_to_interface(shznet_ip& info, unsigned char* buffer, int32_t len) override { return send_packet(info, buffer, len); }
 
-        bool _local_adr_get = true;
-        shznet_adr& local_adr() override
-        {
+    void update() override
+    {
+        GenericUDPSocket::update();
+    }
+
+    bool _local_adr_get = true;
+    shznet_adr& local_adr() override
+    {
 #if defined(ESP_ETH) || defined(ESP32_ETH)
-            IPAddress adr;
-            if (!ETH.linkUp())
-                adr = WiFi.localIP();
-            else
-                adr = ETH.localIP();
+        IPAddress adr;
+        if (!ETH.linkUp())
+            adr = WiFi.localIP();
+        else
+            adr = ETH.localIP();
 #else
-            IPAddress adr = WiFi.localIP();
+        IPAddress adr = WiFi.localIP();
 #endif
-            for (int32_t i = 0; i < 4; i++)
-                m_localadr.ip.ip[i] = adr[i];
-            if (_local_adr_get)
-            {
-                esp_read_mac(m_localadr.mac.mac, ESP_MAC_EFUSE_FACTORY);
-            }
-            _local_adr_get = false;
-            return m_localadr;
+        for (int32_t i = 0; i < 4; i++)
+            m_localadr.ip.ip[i] = adr[i];
+        if (_local_adr_get)
+        {
+            esp_read_mac(m_localadr.mac.mac, ESP_MAC_EFUSE_FACTORY);
         }
-    };
+        _local_adr_get = false;
+        return m_localadr;
+    }
+};
 
-    typedef GenericESPSocket shznet_udp;
+typedef GenericESPSocket shznet_udp;
 
 #elif ARDUINO
 
-    typedef GenericEthernetUDPSocket shznet_udp;
-    template <class T> using shznet_vector = std::vector<T>;
+typedef GenericEthernetUDPSocket shznet_udp;
+template <class T> using shznet_vector = std::vector<T>;
 
 #else
 
@@ -2668,8 +2772,8 @@ class GenericOSUDPSocket : public GenericUDPSocket
         uint64_t recv_time;
     }PACKED_ATTR;
 
-    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 1024*10, packet_buffer_header> m_asyncbuffer; //asyncrecv
-    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 1024*10, shznet_ip> m_asyncsend;
+    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 1024 * 10, packet_buffer_header> m_asyncbuffer; //asyncrecv
+    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 1024 * 10, shznet_ip> m_asyncsend;
     shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 256, shznet_ip> m_asyncsend_artnet;
     shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 256, shznet_ip> m_asyncsend_prio;
     shznet_async_buffer_mpsc<sizeof(shznet_pkt_diagnostic), 256, shznet_async_header> m_asyncsend_diagnostic;
@@ -2718,7 +2822,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
         shznet_timer_high_resolution m_pkt_delay_timer = shznet_timer_high_resolution(0);
         double          m_pkt_delay = 0.0; //delay packets in microseconds
         bool            m_pkt_reset = false;
-   
+
         shznet_timer    m_needs_ack_timeout = shznet_timer(1000); //1000ms ping max
         bool            m_needs_ack = false;
         bool            m_force_ack = false;
@@ -2878,8 +2982,8 @@ class GenericOSUDPSocket : public GenericUDPSocket
                     return true;
             }
             //cannot send pkt yet, put it into the queue buffer..
-            
-            printf("Try_send new buffer!\n");
+
+            //printf("Try_send new buffer!\n");
             return get_free_buffer(buffer, size, prio, recv_timestamp);
         }
 
@@ -2901,16 +3005,16 @@ class GenericOSUDPSocket : public GenericUDPSocket
                 return !m_send_flush.empty();
             }
 
-               
+
             if (m_pkt_reset || m_pkt_delay_timer.delay() > 1000 * 100) //100ms delay....
             {
                 m_pkt_reset = false;
                 if (m_pkt_delay_timer.ready())
                     m_pkt_delay_timer.reset_ready();
             }
-                
+
             //NETPRNT_FMT("test: %i\n", missed_pkt_resets);
-                
+
             if (!m_send_flush.empty() && debug_timer.update())
             {
                 NETPRNT_FMT("%i pps, %i bps, %f tt, %i in.\n", m_pps.pps(), m_pps.bps(), (float)m_pkt_delay, (int)m_send_flush.size());
@@ -2919,7 +3023,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
             auto current_time = shznet_millis();
 
             if (m_send_flush_diag_response)
-            {                  
+            {
                 if (send_diagnostic_pkt((shznet_pkt_diagnostic*)m_send_flush_diag.data(), m_send_flush_diag_timestamp))
                 {
                     m_send_flush_diag_response = false;
@@ -2969,7 +3073,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
 
             auto local_delay = timestamp_recv >= diags->timestamp ? timestamp_recv - diags->timestamp : 0;
             int64_t ping = local_delay >= diags->timestamp_delay ? (local_delay - diags->timestamp_delay) / 2 : 0;
-                
+
             if (ping < 0) ping = 0;
 
             m_ping = m_ping * 0.9 + ping * 0.1;
@@ -3094,7 +3198,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
     }
 
     bool send_loop_try_send(shznet_ip& adr, byte* buffer, uint32_t size, send_pkt_priority prio, uint64_t recv_timestamp = 0)
-    {           
+    {
         if (adr.is_broadcast())
         {
             if (!send_packet_to_interface(adr, buffer, size))
@@ -3143,7 +3247,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
             {
                 shznet_async_header hdr;
                 shznet_pkt_diagnostic* diag_pkt = (shznet_pkt_diagnostic*)m_async_diag_response.read(&max_len, &hdr);
-                if (!diag_pkt) 
+                if (!diag_pkt)
                     break;
 
                 auto it = m_send_endpoints.find(hdr.ip);
@@ -3221,7 +3325,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
                 is_sending_data = true;
                 if (send_loop_try_send(adr, (byte*)chunk, max_len, SEND_PKT_NORMAL))
                 {
-                    m_asyncsend.read();                         
+                    m_asyncsend.read();
                 }
                 else
                 {
@@ -3229,7 +3333,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
                     continue;
                 }
             }
-               
+
 #ifdef _WIN32
             high_resolution_wait(wait_time);
 #else
@@ -3269,6 +3373,12 @@ class GenericOSUDPSocket : public GenericUDPSocket
 
         while (m_threads_active)
         {
+            //Call interrupt wakeup as soon as we have read all packets so we dont spam it
+
+            if (on_receive_ready && !m_udp.socket_data_available())
+                on_receive_ready();
+
+            //Then go back to blocking recvwait
             rs = m_udp.sock_receive(m_recv_buffer, SHZNET_PKT_MAX, tmp, local_ip);
 
             if (!m_threads_active)
@@ -3278,7 +3388,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
             {
                 //NETPRNT_FMT("recv error! %i\n", errno);
                 continue;
-            }             
+            }
             uint64_t recv_time = shznet_millis();
             shznet_ip rm_ip(tmp.port);
             memcpy(&rm_ip.ip[0], &tmp.adr.ip[0], 4);
@@ -3287,12 +3397,18 @@ class GenericOSUDPSocket : public GenericUDPSocket
             packet_buffer_header hdr;
             hdr.ip = rm_ip;
             hdr.recv_time = recv_time;
-            m_asyncbuffer.write(m_recv_buffer, rs, &hdr);
+
+            if (!m_asyncbuffer.write(m_recv_buffer, rs, &hdr))
+            {
+                printf("missing packets!");
+                if (on_receive_ready)
+                    on_receive_ready();
+            }
         }
         m_recvloop_active = false;
     }
 
-    void handle_diagnostics(shznet_ip& adr, shznet_pkt_diagnostic* diags) override 
+    void handle_diagnostics(shznet_ip& adr, shznet_pkt_diagnostic* diags) override
     {
         shznet_async_header hdr(adr, shznet_millis());
         m_async_diag_response.write((byte*)diags, sizeof(shznet_pkt_diagnostic), &hdr);
@@ -3303,7 +3419,7 @@ class GenericOSUDPSocket : public GenericUDPSocket
     bool preprocess_packet(shznet_ip& adr, byte* data, int32_t size) override
     {
         auto res = GenericUDPSocket::preprocess_packet(adr, data, size);
-        if(res) flush_send_buffer(true);
+        if (res) flush_send_buffer(true);
         return res;
     }
 
@@ -3327,7 +3443,7 @@ public:
 
     virtual ~GenericOSUDPSocket()
     {
-            
+
         m_threads_active = false;
         NETPRNT("join sendloop...");
         while (m_sendloop_active || m_recvloop_active)
@@ -3335,7 +3451,7 @@ public:
             m_sendsignal.notify_one();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        if(m_sendloop.joinable()) m_sendloop.join();
+        if (m_sendloop.joinable()) m_sendloop.join();
         if (m_recvloop.joinable()) m_recvloop.join();
 
         while (m_send_endpoint_free_buffers.size())
@@ -3377,7 +3493,7 @@ public:
         {
             res = false;
         }
-         
+
         if (!res)
             return false;
 
@@ -3435,7 +3551,7 @@ public:
         return res;
     }
     bool send_packet_prio(shznet_ip& info, unsigned char* buffer, int32_t len) override
-    {         
+    {
         auto res = m_asyncsend_prio.write(buffer, len, &info);
         m_sendflush = true;
         flush_send_buffer(true);
@@ -3465,7 +3581,7 @@ public:
     {
         if (m_sendflush || force)
         {
-            if(!force) m_sendflush = 0;
+            if (!force) m_sendflush = 0;
 #ifdef _WIN32
             SetEvent(m_win_interrupt);
 #else
@@ -3511,6 +3627,8 @@ public:
 
         return m_localadr;
     }
+
+    std::function<void()> on_receive_ready;
 };
 
 typedef GenericOSUDPSocket shznet_udp;

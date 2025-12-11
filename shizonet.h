@@ -15,6 +15,10 @@
 
 #define SHZNET_COMPAT_VERSION 14
 
+ //Server port is different from client to reduce traffic processing on devices
+ //Servers scan both client and server port
+#define SHZNET_SERVER_PORT (ART_NET_PORT+1)
+#define SHZNET_CLIENT_PORT (ART_NET_PORT)
 
 #ifdef ARDUINO_ARCH_ESP32
 //esp32 can have OSC support
@@ -32,26 +36,26 @@
 
 
 #ifdef ARDUINO_ARCH_ESP32
-    #if defined(ESP_P4) || defined(ESP32_P4) //Stronger
-        #define SHZNET_MAX_RECV (1024 * 1024) 
-        #define SHZNET_MAX_RECV_BUFFERS (8) 
-        #define SHZNET_MAX_RECV_OOB (1024 * 512) 
-        #define SHZNET_PACKET_PACING_COUNT 8
-    #else
-        #define SHZNET_MAX_RECV (1024 * 50) //50kb
-        #define SHZNET_MAX_RECV_BUFFERS (4) //3 Buffers (~30kb)
-        #define SHZNET_MAX_RECV_OOB (1024 * 10) //10kb OOB data 
-        #define SHZNET_PACKET_PACING_COUNT 1 //Send X packets at once and then wait for the microcontroller to process them before sending more
-                                            //This is based on the arduino pacing code which sends packets every 2 ms (to get 60 FPS at 16ms total window, sending 4*4 universes over that window)
-                                            //You can send a total of SHZNET_PACKET_PACING_COUNT * 4 per frame before it will start to lag (sadly RECVMSGBOXSIZE in ESP IDF is pretty low...)
-                                            //This value has been carefully trial and error'd, trying to get more data through the ESP by sending more packets
-                                            //is generally a bad idea, the only thing you can do is increase the payload on each packet to get more data thru
-    #endif
+#if defined(ESP_P4) || defined(ESP32_P4) //Stronger
+#define SHZNET_MAX_RECV (1024 * 1024) 
+#define SHZNET_MAX_RECV_BUFFERS (8) 
+#define SHZNET_MAX_RECV_OOB (1024 * 512) 
+#define SHZNET_PACKET_PACING_COUNT 8
 #else
-    #define SHZNET_MAX_RECV (1024 * 1024 * 128) //128MB max at once
-    #define SHZNET_MAX_RECV_BUFFERS (-1)
-    #define SHZNET_MAX_RECV_OOB (1024 * 1024) //1mb OOB data 
-    #define SHZNET_PACKET_PACING_COUNT 0
+#define SHZNET_MAX_RECV (1024 * 50) //50kb
+#define SHZNET_MAX_RECV_BUFFERS (4) //3 Buffers (~30kb)
+#define SHZNET_MAX_RECV_OOB (1024 * 10) //10kb OOB data 
+#define SHZNET_PACKET_PACING_COUNT 1 //Send X packets at once and then wait for the microcontroller to process them before sending more
+                                    //This is based on the arduino pacing code which sends packets every 2 ms (to get 60 FPS at 16ms total window, sending 4*4 universes over that window)
+                                    //You can send a total of SHZNET_PACKET_PACING_COUNT * 4 per frame before it will start to lag (sadly RECVMSGBOXSIZE in ESP IDF is pretty low...)
+                                    //This value has been carefully trial and error'd, trying to get more data through the ESP by sending more packets
+                                    //is generally a bad idea, the only thing you can do is increase the payload on each packet to get more data thru
+#endif
+#else
+#define SHZNET_MAX_RECV (1024 * 1024 * 128) //128MB max at once
+#define SHZNET_MAX_RECV_BUFFERS (-1)
+#define SHZNET_MAX_RECV_OOB (1024 * 1024) //1mb OOB data 
+#define SHZNET_PACKET_PACING_COUNT 0
 #endif
 
 #define INVALID_SESSIONID shznet_sessionid(-1)
@@ -246,7 +250,7 @@ protected:
     shznet_pkt_diagnostic_request m_send_diag;
 
     std::mutex m_endpoint_mutex; //Not quite perfect but quick and dirty solution, somewhat find a better solution
-        //for a thread safe shared endpoint structure....
+    //for a thread safe shared endpoint structure....
     std::unordered_map<shznet_mac, shznet_endpoint_s> m_endpoints;
     std::unordered_map<shznet_mac, shznet_stream_endpoint_s> m_stream_endpoints;
 
@@ -331,7 +335,7 @@ public:
         m_nodename = name;
     }
 
-    bool init(std::string node_name, short port = ART_NET_PORT)
+    bool init(std::string node_name, short port = SHZNET_CLIENT_PORT)
     {
         if (node_name.length() > 16)
             node_name = node_name.substr(0, 16);
@@ -339,13 +343,13 @@ public:
         m_nodename = node_name;
 
         m_udp.init();
-        if (port == ART_NET_PORT)
+        if (port == SHZNET_SERVER_PORT)
         {
             int try_port = port;
             while (!m_udp.bind(try_port))
             {
                 try_port++;
-                if ((try_port - ART_NET_PORT) > 100)
+                if ((try_port - SHZNET_SERVER_PORT) > 100)
                     return false;
             }
             return true;
@@ -463,7 +467,7 @@ public:
         m_udp.update();
 
         int32_t         packet_len = 0;
-        char*           packet_data = 0;
+        char* packet_data = 0;
         shznet_ip       packet_ip;
         uint64_t        packet_recv_time = 0;
 
@@ -528,7 +532,7 @@ public:
             {
                 bool exit_loop = false;
                 if (art_dmx_callback || art_frame_callback || m_always_enable_artnet)
-                {                
+                {
                     exit_loop = handle_artnet(packet_ip, (byte*)packet_data, packet_len, packet_recv_time);
                 }
                 m_udp.flush_packet();
@@ -741,7 +745,7 @@ public:
                 return;
             }
 
-            cb->second(adr, pkt->get_data(), pkt->get_data_size(), pkt->header);           
+            cb->second(adr, pkt->get_data(), pkt->get_data_size(), pkt->header);
         }
     }
 
@@ -760,13 +764,13 @@ public:
             endpoint->second.reset_timeout();
             sessid = endpoint->second.sessionid;
         }
-       
+
         m_send_buffer.packet_begin(SHZNET_PKT_AUTH_BEACON_REPLY, get_udp().local_adr().mac, target_mac, 0, sessid);
         m_send_buffer.header.flags = SHZNET_PKT_FLAGS_RECEIVER_ONLY;
         m_send_buffer.packet_set_data((byte*)this->m_nodename.c_str(), std::min((size_t)128, this->m_nodename.size()));
         m_send_buffer.packet_set_format(SHZNET_PKT_FMT_STRING);
         uint32_t pkt_size = m_send_buffer.packet_end();
-        if(!m_udp.send_packet_to_interface(adr, (uint8_t*)&m_send_buffer, pkt_size))
+        if (!m_udp.send_packet_to_interface(adr, (uint8_t*)&m_send_buffer, pkt_size))
             m_udp.send_buffered(adr, (uint8_t*)&m_send_buffer, pkt_size);
     }
 
@@ -923,7 +927,7 @@ public:
                     }
 
                     //Fix up current frame, we havent finished the last one yet but pkts are missing, make sure this frame gets the chance to update now
-                    if(missed_pkts_start_uni >= 0)
+                    if (missed_pkts_start_uni >= 0)
                         dmx_frame->rcv2[missed_pkts_start_uni] = dmx_frame->rcv1[missed_pkts_start_uni] + 1;
 
                     artnet_frame_timer.reset();
@@ -932,7 +936,7 @@ public:
                     {
                         if (art_frame_callback) art_frame_callback(0);
                     }
-                    
+
                     return true;
                 }
             }
@@ -1046,7 +1050,7 @@ public:
         {
             m_order_check_flag = false;
 
-            for (auto &it : m_endpoints)
+            for (auto& it : m_endpoints)
             {
                 auto& orders = it.second.orders;
                 for (auto it = orders.begin(); it != orders.end();)
@@ -1056,7 +1060,7 @@ public:
                         NETPRNT("order buffer timeout!");
                         order_buffers_data.recycle(it->second->data);
                         it->second->data = 0;
-                        it->second->reset_buffer();                        
+                        it->second->reset_buffer();
                         order_buffers.recycle(it->second);
                         it = orders.erase(it);
                     }
@@ -1234,7 +1238,7 @@ public:
                 }
 
                 memcpy(&buff->data->data()[byte_offset], pkt->data, pkt->header.data_size);
-                
+
                 buff->data_count--;
             }
             else
@@ -1314,7 +1318,7 @@ public:
 
         shznet_mac target_mac(pkt->source_mac());
 
-        auto &ep = m_stream_endpoints[target_mac];
+        auto& ep = m_stream_endpoints[target_mac];
 
         auto& orders = ep.orders;
 
@@ -1437,7 +1441,7 @@ public:
 
             ack.missing_start_id = -4;
             ack.missing_end_id = -4;
-                       
+
             ack.sessionid = pkt->sessionid;
             ack.ticketid = pkt->ticketid;
             memcpy(ack.mac, local_mac().mac, 6);
@@ -1445,7 +1449,7 @@ public:
             ack.ack_id = pkt->ack_id;
             ack.make_checksum();
             m_udp.send_buffered_prio(adr, (byte*)&ack, sizeof(shznet_pkt_ack));
-            return;       
+            return;
         }
 
         ep->second.reset_timeout();
@@ -1458,7 +1462,7 @@ public:
         memcpy(ack.mac, local_mac().mac, 6);
         ack.type = pkt->type;
         ack.ack_id = pkt->ack_id;
-      
+
         //do ack request ping pong to first check for complete, then check for delete ??
         //check for delete, if missing_start and missing_end == -1 (not found) its ok on server
 
@@ -1542,10 +1546,10 @@ public:
                 order_buffers_data.recycle(entry->second->data);
                 entry->second->data = 0;
                 entry->second->reset_buffer();
-                
+
                 order_buffers.recycle(entry->second);
 
-                orders.erase(entry);
+                orders.erase(pkt->ticketid);
                 //clear cmd buffer here
                 ack.missing_start_id = 0;
                 ack.missing_end_id = 0;
@@ -1553,7 +1557,7 @@ public:
                 m_udp.send_buffered_prio(adr, (byte*)&ack, sizeof(shznet_pkt_ack));
                 return;
             }
-         
+
         }
 
         //order not found, request to resend the whole order...
@@ -1870,7 +1874,7 @@ class shznet_device
                 return;
 
             uint32_t chunk_start = offset / single_chunk_size;
-            uint32_t chunk_count = ((offset - chunk_start*single_chunk_size) + (size-1)) / single_chunk_size + 1;
+            uint32_t chunk_count = ((offset - chunk_start * single_chunk_size) + (size - 1)) / single_chunk_size + 1;
 
             for (uint32_t i = chunk_start; i < std::min((uint32_t)buffer_parts_dirty.size(), chunk_start + chunk_count); i++)
             {
@@ -1993,10 +1997,8 @@ class shznet_device
     std::vector<command_buffer_s*>              response_buffers;
 
     std::vector < std::pair<shznet_ticketid, std::function<void(bool)>>> send_finish_callbacks;
-    
-    shznet_small_allocator<auth_info_s> auth;
 
-    bool receiver_only = false;
+    shznet_small_allocator<auth_info_s> auth;
 
     bool order_valid(shznet_ticketid id)
     {
@@ -2008,8 +2010,10 @@ class shznet_device
         return false;
     }
 
+    bool                receiver_only = false;
+
 protected:
-    shznet_base_impl*   base = 0;
+    shznet_base_impl* base = 0;
     std::string         name = "UNKNOWN";
     std::string         description = "UNKNOWN";
     shznet_adr          address;
@@ -2040,7 +2044,7 @@ protected:
     //Static buffer diags
     uint64_t static_buffers_sendindex = 0;
     shznet_timer static_buffers_diag_timer = shznet_timer(16);
- 
+
     friend class shznet_base_impl;
     friend class shznet_base;
 
@@ -2068,7 +2072,7 @@ protected:
                     return command_buffer_send_fail;
 
                 shznet_pkt& pkt = buff->pkts[buff->send_index];
-                
+
                 if (!sendto(&pkt, pkt.get_packet_size()))
                 {
                     return command_buffer_send_fail;
@@ -2090,7 +2094,7 @@ protected:
             //no point in resending missing chunks while the sequence is still being sent
             //will just confuse the receiver
             //However, when we're finished sending we can start sending/flushing etc...
-            if(buff->send_index != buff->pkts.size())
+            if (buff->send_index != buff->pkts.size())
                 return command_buffer_sending;
         }
 
@@ -2150,7 +2154,7 @@ protected:
                 buff->missing_chunk_high = -1;
             }
         }
-        
+
 
         if (!buff->start_ack)
         {
@@ -2161,7 +2165,7 @@ protected:
             return command_buffer_wait_ack;
 
         shznet_pkt_ack_request req;
-            
+
         req.type = buff->start_cleanup ? shznet_ack_request_delete_buffer : shznet_ack_request_complete;
         req.sessionid = get_sessionid();
         req.ticketid = buff->ticketid;
@@ -2170,7 +2174,7 @@ protected:
         memcpy(req.mac, get_local_mac().mac, 6);
 
         req.make_checksum();
-            
+
         if (!sendto(&req, sizeof(shznet_pkt_ack_request)))
         {
             return command_buffer_send_fail;
@@ -2239,6 +2243,8 @@ public:
 
     std::unordered_map<uint32_t, std::string> command_map;
     std::unordered_map<uint32_t, std::string> command_response_map;
+    bool                                      received_state = false;
+
 
     shznet_device(shznet_base_impl* _base, shznet_adr& adr, std::string _name = "", std::string _description = "")
     {
@@ -2429,7 +2435,7 @@ public:
     }
 
     uint32_t get_static_buffer_count() { return network_buffers_static_list.size(); }
-    
+
     std::vector<std::string> get_static_buffer_names()
     {
         std::vector<std::string> result;
@@ -2438,7 +2444,7 @@ public:
         return result;
     }
 
-    std::string get_static_buffer_desc(std::string& name)
+    std::string_view get_static_buffer_desc(std::string& name)
     {
         auto hs = shznet_hash(name);
         auto it = network_buffers_static.find(hs);
@@ -2447,7 +2453,7 @@ public:
         return it->second->description;
     }
 
-    std::string get_static_buffer_desc(uint32_t index)
+    std::string_view get_static_buffer_desc(uint32_t index)
     {
         if (index < network_buffers_static_list.size())
         {
@@ -2456,7 +2462,7 @@ public:
 
         return "";
     }
-    std::string get_static_buffer_setup(std::string& name)
+    std::string_view get_static_buffer_setup(std::string& name)
     {
         auto hs = shznet_hash(name);
         auto it = network_buffers_static.find(hs);
@@ -2465,7 +2471,7 @@ public:
         return it->second->setup;
     }
 
-    std::string get_static_buffer_setup(uint32_t index)
+    std::string_view get_static_buffer_setup(uint32_t index)
     {
         if (index < network_buffers_static_list.size())
         {
@@ -2493,7 +2499,6 @@ public:
         return it->second->type;
     }
 
-
     bool send_unreliable(const char* cmd, byte* data, size_t size, shznet_pkt_dataformat fmt = SHZNET_PKT_FMT_DATA, bool is_stream = false)
     {
         if (!base) return 0;
@@ -2510,7 +2515,7 @@ public:
 
             buf.packet_begin(SHZNET_PKT_OOB, get_local_mac(), get_mac(), get_new_ticketid(), get_sessionid());
             buf.packet_set_cmd((char*)cmd);
-            if(data && size)
+            if (data && size)
                 buf.packet_set_data(data, size);
             buf.packet_set_unreliable();
             if (is_stream) buf.packet_set_stream_flag();
@@ -2520,7 +2525,7 @@ public:
         }
 
         //sequence the packet !
-        
+
         uint32_t max_sequence = max_data_size ? size / max_data_size : 0;
 
         //special case
@@ -2549,7 +2554,7 @@ public:
             }
 
             data_index += max_data_size;
-                //std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            //std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
         return 1;
@@ -2586,7 +2591,7 @@ public:
 
             buf.packet_begin(SHZNET_PKT_GENERIC, get_local_mac(), get_mac(), cmd_buf->ticketid, get_sessionid());
             buf.packet_set_cmd((char*)cmd);
-            if(data && size)
+            if (data && size)
                 buf.packet_set_data(data, size, size);
             buf.packet_set_format(fmt);
             buf.packet_end();
@@ -2678,7 +2683,7 @@ public:
     }
 
     shznet_timer network_measure = shznet_timer(1000 * 3);
-    
+
     bool check_packet_pacing(bool increase_pkt_counter = true)
     {
         auto send_group = m_current_send_group;
@@ -2712,7 +2717,7 @@ public:
 
         if (m_max_packets_pacing_counter >= max_packets_before_pacing)
             return true;
-        
+
         m_max_packets_pacing_counter++;
 
         return false;
@@ -2757,7 +2762,7 @@ public:
         bool send_group_update = m_current_send_group != send_group;
         m_current_send_group = send_group;
 
-        uint32_t max_sends = 
+        uint32_t max_sends =
 #ifdef ARDUINO
             32;
 #else
@@ -2789,7 +2794,7 @@ public:
                         keep_sending = true;
                     else if (state == command_buffer_send_fail)
                         break;
-                    max_queries++; 
+                    max_queries++;
                 }
             }
 
@@ -2883,7 +2888,7 @@ public:
                 for (auto it = unordered_buffers.begin(); it != unordered_buffers.end(); )
                 {
                     auto buf = *it;
-                    
+
                     if (buf->device_busy && !buf->device_busy_timer.update())
                     {
                         it++;
@@ -2923,7 +2928,7 @@ public:
             {
                 if (send_group == 0)
                 {
-                    if(network_buffer_current >= network_buffers_static_list.size())
+                    if (network_buffer_current >= network_buffers_static_list.size())
                         network_buffer_current = 0;
                     else
                     {
@@ -2974,7 +2979,7 @@ public:
                     }
 
                     if (network_buffer_send.get_buffer().size() > network_buffer_size_low)
-                    { 
+                    {
                         if (network_buffer_current == network_buffers_static_list.size())
                             network_buffer_send.add_int32("end", 1);
 
@@ -2997,7 +3002,7 @@ public:
             }
         }
 
-        if(flush_buffer)
+        if (flush_buffer)
             flush_send_buffers();
 
         if (pps_counter && bps_counter && network_measure.update())
@@ -3072,7 +3077,7 @@ public:
             buf.packet_begin(SHZNET_PKT_GENERIC, get_local_mac(), get_mac(), cmd_buf->ticketid, get_sessionid());
             buf.packet_set_cmd((char*)cmd);
             buf.packet_set_data(extra_data);
-            if(data && size)
+            if (data && size)
                 buf.packet_set_data(data, size, size + sizeof(extra_data), sizeof(extra_data));
             buf.packet_set_format(fmt);
             buf.packet_end();
@@ -3084,7 +3089,7 @@ public:
             return cmd_buf->ticketid;
         }
 
-        uint32_t max_sequence = max_data_size ? (size+sizeof(extra_data)) / max_data_size : 0;
+        uint32_t max_sequence = max_data_size ? (size + sizeof(extra_data)) / max_data_size : 0;
 
         //special case
         if ((max_sequence * max_data_size == (size + sizeof(extra_data))) && max_sequence)
@@ -3106,7 +3111,7 @@ public:
             if (i == 0)
             {
                 buf.packet_set_data(extra_data);
-                buf.packet_set_data(&data[data_index], std::min((size_t)(max_data_size - sizeof(extra_data)), (size_t)(size - data_index)), size+sizeof(extra_data), sizeof(extra_data));
+                buf.packet_set_data(&data[data_index], std::min((size_t)(max_data_size - sizeof(extra_data)), (size_t)(size - data_index)), size + sizeof(extra_data), sizeof(extra_data));
             }
             else
                 buf.packet_set_data(&data[data_index], std::min(max_data_size, (size_t)(size - data_index)), size + sizeof(extra_data));
@@ -3123,7 +3128,7 @@ public:
         return cmd_buf->ticketid;
     }
 
-    void set_static_buffer_leds(network_buffer_static_s &nb, int start_adr, byte* data_buffer, size_t data_size, size_t data_offset,
+    void set_static_buffer_leds(network_buffer_static_s& nb, int start_adr, byte* data_buffer, size_t data_size, size_t data_offset,
         int input_channels = 1)
     {
         if (!data_size)
@@ -3252,6 +3257,7 @@ public:
     float get_packets_per_ms() { return max_pkts_per_loop; }
 
     bool _has_shizoscript_json = false;
+    bool _has_shizoscript_json_v3 = false;
 
     uint32_t _init_connection_attempts = 0;
     uint32_t _init_test = 0;
@@ -3283,9 +3289,9 @@ class shznet_artnet_device
     };
 
     shznet_small_allocator<artnet_buffer_s> artnet_buffer;
-   
+
 protected:
-    shznet_base_impl*   base = 0;
+    shznet_base_impl* base = 0;
     std::string         name;
     std::string         description;
     shznet_adr          address;
@@ -3556,8 +3562,6 @@ public:
         }
     }
 };
-
-
 //TODO in ESP32 wifi socket class, check if the receiving ticket is in the last 10 recv. ticket list, if so, discard directly!!! (dont fill buffer)
 
 typedef std::shared_ptr<shznet_device> shznet_device_ptr;
@@ -3567,19 +3571,19 @@ typedef std::shared_ptr<shznet_artnet_device> shznet_artnet_device_ptr;
 class shznet_command
 {
     shznet_device_ptr   _dev;
-    shznet_pkt_header*  _hdr;
-    byte*               _data;
+    shznet_pkt_header* _hdr;
+    byte* _data;
     size_t              _size;
 public:
     shznet_command(shznet_device_ptr dev, shznet_pkt_header* hdr, byte* data, size_t size) : _dev(dev), _hdr(hdr), _data(data), _size(size) {};
 
-    byte*                   data() { return _data; }
+    byte* data() { return _data; }
     size_t                  size() { return _size; }
     shznet_pkt_dataformat   format() { return _hdr->data_format; }
-    shznet_pkt_header&      header() { return *_hdr; }
-    shznet_device*     device() { return _dev.get(); }
+    shznet_pkt_header& header() { return *_hdr; }
+    shznet_device* device() { return _dev.get(); }
 
-    shznet_ip&  ip() { return _dev->get_ip(); }
+    shznet_ip& ip() { return _dev->get_ip(); }
     shznet_mac& mac() { return _dev->get_mac(); }
     uint16_t    port() { return _dev->get_ip().port; }
 };
@@ -3642,7 +3646,7 @@ protected:
 
     shznet_timer m_wait_responses_timeout_check = shznet_timer(1000 * 5);
 
-    virtual void on_device_connect(shznet_device_ptr dev_info) 
+    virtual void on_device_connect(shznet_device_ptr dev_info)
     {
     }
 
@@ -3650,9 +3654,9 @@ protected:
     {
     }
 
-    virtual void on_device_disconnect(shznet_device_ptr dev_info, const char* reason) 
+    virtual void on_device_disconnect(shznet_device_ptr dev_info, const char* reason)
     {
-        
+
     }
 
     shznet_timer check_device_timer;
@@ -3669,7 +3673,7 @@ protected:
                 return;
         for (auto& it : finalize_device_connections)
             if (it.get() == dev_info.get())
-                return;      
+                return;
 
         SHIZONETLOG("On connect internal %s\n", dev_info->get_name().c_str());
         dev_info->_init_connection_attempts = 0;
@@ -3693,7 +3697,7 @@ protected:
         }
     }
 
-    virtual void handle_response_disconnect(shznet_device_ptr &dev_ptr) {}
+    virtual void handle_response_disconnect(shznet_device_ptr& dev_ptr) {}
     virtual void handle_response_failed(shznet_ticketid id) {}
     virtual void handle_response_add(response_wait rw) {}
 
@@ -3711,14 +3715,14 @@ protected:
     bool            send_artnet_sync = true;
     int             artnet_send_group = 0;
     shznet_timer    artnet_delay = shznet_timer(2); //target to send 16 universes at 60 FPS with 4 universes every 2-4 milliseconds
-                                                    //Really not sure what the right value would be for this as this depends on the device + the OS actually sending data...
-                                                    //2 seems to work fine with esp32, 3 would be a good middle ground and 4 is the max this value should ever be.
+    //Really not sure what the right value would be for this as this depends on the device + the OS actually sending data...
+    //2 seems to work fine with esp32, 3 would be a good middle ground and 4 is the max this value should ever be.
 
     bool            m_shizonet_enabled = true;
 
-                    //This is not used yet, the correct way for this to work
-                    //would be to obtain all IP addresses from all interfaces
-                    //And send broadcast messages to all of that addresses from all interfaces
+    //This is not used yet, the correct way for this to work
+    //would be to obtain all IP addresses from all interfaces
+    //And send broadcast messages to all of that addresses from all interfaces
     bool            m_poll_broadcast_subnet_switch = false;
 
     bool is_client_only = false;
@@ -3758,13 +3762,13 @@ public:
         m_devices_temp.clear();
         for (auto it : m_devices)
         {
-            if(it.second)
+            if (it.second)
                 m_devices_temp.push_back(it.second);
         }
 
         for (auto it : m_devices_temp)
         {
-            if(it)
+            if (it)
                 it->clear_command_buffer(tid, true, false);
         }
         m_devices_temp.clear();
@@ -3788,151 +3792,10 @@ public:
 
                     send_shz_poll(dev_ptr->get_address());
                     NETPRNT_FMT("testing device %s.\n", dev_ptr->get_name().c_str());
-                    
+
                     SHIZONETLOG("Testing: %s %s\n", dev_ptr->get_name().c_str(), dev_ptr->get_mac().str().c_str());
 
-                    uint32_t receive_cmd_defs = /*!is_client_only*/true;
-                    
-                    auto tid = dev_ptr->send_get(
-                        SHZNET_TEST_CMD,
-                        (byte*)&receive_cmd_defs, sizeof(receive_cmd_defs),
-                        SHZNET_PKT_FMT_INT32,
-                        [this, dev_ptr, receive_cmd_defs](byte* data, size_t size, shznet_pkt_dataformat fmt, bool success) {
-                            if (!success || !size) {
-                                //disconnect_device(dev_ptr->get_mac(), "init connection failed.");
-                                NETPRNT("init connection failed.");
-                                SHIZONETLOG("%s Init connection failed!\n", dev_ptr->get_name().c_str());
-                                if (dev_ptr->_init_connection_attempts < 3)
-                                {
-                                    NETPRNT("retrying...");
-                                    bool fix_me = false;
-                                    for (auto& it : check_device_connections) {
-                                        if (it.get() == dev_ptr.get()) {
-                                            fix_me = true;
-                                            break;
-                                        }
-                                    }
-                                    if (!fix_me) {
-                                        check_device_connections.push_back(dev_ptr);
-                                        dev_ptr->_init_connection_attempts++;
-                                    }
-                                }
-                                else
-                                {
-                                    NETPRNT("disconnecting device...");
-                                    disconnect_device(dev_ptr->get_mac(), "init connection failed.");
-                                }
-                                return;
-                            }
-
-                            dev_ptr->command_map.clear();
-                            dev_ptr->command_response_map.clear();
-                            dev_ptr->network_buffers_static.clear();
-                            dev_ptr->network_buffers_static_list.clear();
-                            dev_ptr->network_buffers_static_list_leds.clear();
-                            dev_ptr->network_buffers_static_list_data.clear();
-
-                            shznet_kv_reader kvr(data, size);
-
-                            if (!kvr.read()) {
-                                disconnect_device(dev_ptr->get_mac(), "init connection failed (invalid kv).");
-                                return;
-                            }
-
-                            if (kvr.get_value_size() != sizeof(uint32_t)) {
-                                disconnect_device(dev_ptr->get_mac(), "init connection failed (invalid kv version size).");
-                                return;
-                            }
-
-                            //This is kinda ugly and we could do better, but keep it for now for compatibility (deprecated, use kvr.read_int32() in future)
-                            auto version = *(uint32_t*)kvr.get_value();
-
-                            if (version != 1)
-                            {
-                                auto cmds = kvr.read_kv("commands");
-                                while (cmds.read())
-                                {
-                                    shznet_command_defs* def = (shznet_command_defs*)cmds.get_value();
-                                    if (def && cmds.get_value_size() == sizeof(shznet_command_defs))
-                                    {
-                                        if (!def->type) {
-                                            dev_ptr->command_map[def->hash] = cmds.get_key();
-                                        }
-                                        else {
-                                            dev_ptr->command_response_map[def->hash] = cmds.get_key();
-                                        }
-                                    }
-                                }
-
-                                auto buffers = kvr.read_kv("static_buffers");
-                                auto buffer_desc = kvr.read_kv("static_buffers_desc");
-                                auto buffer_setups = kvr.read_kv("static_buffers_setup");                               
-
-                                while (buffers.read())
-                                {
-                                    shznet_buffer_defs* def = (shznet_buffer_defs*)buffers.get_value();
-                                    if (def && buffers.get_value_size() == sizeof(shznet_buffer_defs))
-                                    {            
-                                        //GCC fix
-                                        auto def_type = def->type;
-                                        auto def_size = def->size;
-
-                                        dev_ptr->network_buffers_static[def->hash] = std::make_shared<shznet_device::network_buffer_static_s>(
-                                            buffers.get_key(),
-                                            (network_buffer_static_type)def_type,
-                                            def_size,
-                                            buffer_desc.read_string(buffers.get_key()),
-                                            buffer_setups.read_string(buffers.get_key())
-                                        );
-
-                                        dev_ptr->network_buffers_static_list.push_back(dev_ptr->network_buffers_static[def->hash]);
-                                        
-                                        if(def->type == network_buffer_static_type::NETWORK_BUFFER_STATIC_DATA)
-                                            dev_ptr->network_buffers_static_list_data.push_back(dev_ptr->network_buffers_static[def->hash]);
-                                        else if(def->type >= NETWORK_BUFFER_STATIC_LEDS_1CH && def->type <= NETWORK_BUFFER_STATIC_LEDS_4CH)
-                                            dev_ptr->network_buffers_static_list_leds.push_back(dev_ptr->network_buffers_static[def->hash]);
-
-                                    }
-                                }
-
-                                SHIZONETLOG("%s has %i cmds and %i buffers (%i).\n", dev_ptr->get_name().c_str(), (int)(dev_ptr->command_map.size() + dev_ptr->command_response_map.size()), (int)dev_ptr->network_buffers_static_list.size(), (int)size);
-                            
-#ifdef ARDUINO
-                                Serial.printf("%s has %i cmds and %i buffers.\n", dev_ptr->get_name().c_str(), (int)(dev_ptr->command_map.size() + dev_ptr->command_response_map.size()), (int)dev_ptr->network_buffers_static_list.size());
-#endif
-
-                            }
-                            else //old compatibility
-                            {
-                                while (kvr.read()) {
-                                    if (kvr.get_value_size() != sizeof(shznet_command_defs)) {
-                                        NETPRNT("command def invalid size!");
-                                        continue;
-                                    }
-                                    shznet_command_defs* def = (shznet_command_defs*)kvr.get_value();
-                                    if (!def->type) {
-                                        dev_ptr->command_map[def->hash] = kvr.get_key();
-                                    }
-                                    else {
-                                        dev_ptr->command_response_map[def->hash] = kvr.get_key();
-                                    }
-                                }
-                            }
-
-                            dev_ptr->_has_shizoscript_json = kvr.read_int32("has_json");
-                            dev_ptr->max_packets_before_pacing = kvr.read_int32("pacing");
-
-                            if (dev_ptr->was_connected)
-                                return;
-
-                            dev_ptr->was_connected = true;
-
-                            SHIZONETLOG("\n%s CONNECTION ESTABLISHED!\n", dev_ptr->get_name().c_str());
-
-                            finalize_device_connections.push_back(dev_ptr);
-                        },
-                        1000 * 15
-                    );
+                    send_init_connection(dev_ptr);
                 }
             }
             if (finalize_device_connections.size())
@@ -3948,11 +3811,11 @@ public:
                         m_devices[it->get_mac()] = it;
 
                     NETPRNT_FMT("%s device connected: %s (%s)\n", it->type == SHZNET_DEV_ARTNET ? "artnet" : "shznet", it->get_name().c_str(), it->get_address().mac.str().c_str());
-                    
+
                     it->reconnect_device(it->get_address());
-                    
+
                     it->connected = true;
-                    
+
                     on_device_connect(it);
                 }
                 finalize_device_connections.clear();
@@ -4072,7 +3935,7 @@ public:
 
                 if (it->timeout && current_time - it->timeout_start >= it->timeout)
                     response_invalid = true;
-               
+
                 auto dev = m_devices.find(it->dev);
                 if (dev == m_devices.end())
                     response_invalid = true;
@@ -4104,17 +3967,17 @@ public:
             for (auto it : m_wait_responses_tmp)
             {
                 cancel_ticket(it.id);
-                if(it.cb) it.cb(0, 0, SHZNET_PKT_FMT_INVALID, 0);
+                if (it.cb) it.cb(0, 0, SHZNET_PKT_FMT_INVALID, 0);
             }
         }
-      
+
         int start_send_grp = artnet_send_group;
         int end_send_grp = start_send_grp;
 
         if (artnet_send_group >= 0)
         {
             while (artnet_delay.update_period(true))
-            {              
+            {
                 for (auto it : m_artnet_devices)
                 {
                     it.second->update(artnet_send_group);
@@ -4134,7 +3997,7 @@ public:
         }
 
         if (m_shizonet_enabled)
-        {          
+        {
             //This may look weird but is just for safety if the update()
             //function somehow invalidates m_devices for whatever reason
             m_devices_temp_ptrs.clear();
@@ -4169,12 +4032,12 @@ public:
         if (artnet_send_group != -1)
         {
 #ifdef _WIN32
-           //printf("ARTNET OVERRUN! %i %i\n", artnet_send_group, (int)artnet_sync_fps_debug.delay_reset());
+            //printf("ARTNET OVERRUN! %i %i\n", artnet_send_group, (int)artnet_sync_fps_debug.delay_reset());
 #endif
             for (int i = artnet_send_group; i < 8; i++)
             {
 
-                for (auto &it : m_artnet_devices)
+                for (auto& it : m_artnet_devices)
                     it.second->update(i);
 
                 for (auto& it : m_devices)
@@ -4196,7 +4059,7 @@ public:
     {
         NETPRNT_ERR("disconnect device!");
         NETPRNT_ERR(reason);
-        
+
         shznet_device_ptr dev = 0;
         bool was_online = false;
         auto online_dev = m_devices.find(id);
@@ -4219,7 +4082,7 @@ public:
             SHIZONETLOG("Disconnect %s because %s.\n", dev->get_name().c_str(), reason);
 
             m_devices_offline[id] = dev;
-            if(was_online) this->on_device_disconnect_internal(dev, reason);
+            if (was_online) this->on_device_disconnect_internal(dev, reason);
             dev->set_invalid();
             dev->reset_offline_timeout();
         }
@@ -4399,7 +4262,7 @@ public:
             dev->reconnect_device(adr);
 
             dev->auth->resend_timer.reset(0);
-            
+
             //UPDATE. keep same session ID alive while we are alive?
             //Doesnt make much sense to change the sessionid unless we restart
             //And it maybe stops endless reconnect loops
@@ -4407,7 +4270,7 @@ public:
             //while (dev->auth->sessionid == old_sessionid)
             //    dev->auth->sessionid = shznet_global.get_new_sessionid();
             //NETPRNT_FMT("new sessionid: %llu old: %llu for %s.\n", dev->auth->sessionid, old_sessionid, dev->get_mac().str().c_str());;
-            
+
             m_devices_pending[adr.mac] = dev;
         }
         else
@@ -4538,7 +4401,7 @@ public:
             if (m_devices.find(adr.mac) != m_devices.end())
             {
                 auto dev = m_devices[adr.mac];
-                
+
                 if (pkt->header.sessionid != -1 && pkt->header.sessionid != dev->auth->sessionid)
                 {
                     disconnect_device(adr.mac, "auth invalid sessionid.");
@@ -4562,7 +4425,7 @@ public:
             {
                 SHIZONETLOG("Auth req repl %s from invalid device.\n", adr.mac.str().c_str());
                 NETPRNT_FMT("received invalid auth reply from %s test: %i\n", adr.mac.str().c_str(), (int)m_devices_pending.size());
-                m_devices_pending[adr.mac] = std::make_shared<shznet_device>(this, adr, "", "");              
+                m_devices_pending[adr.mac] = std::make_shared<shznet_device>(this, adr, "", "");
             }
 
             active_dev = m_devices_pending.find(adr.mac);
@@ -4607,7 +4470,7 @@ public:
         }
     }
 
-    void handle_shizonet_ack(shznet_ip& ip, shznet_pkt_ack* pkt) override 
+    void handle_shizonet_ack(shznet_ip& ip, shznet_pkt_ack* pkt) override
     {
         if (pkt->type == shznet_ack_request_invalid_sessionid)
         {
@@ -4620,7 +4483,7 @@ public:
 
         //NETPRNT("ACK!!!");
         shznet_adr adr(ip.ip, pkt->mac, ip.port);
-        
+
         {
             auto active_dev = m_devices.find(adr.mac);
             if (active_dev != m_devices.end())
@@ -4686,7 +4549,7 @@ public:
         else
         */
         {
-            poll_reply->shortname[18-1] = 0;
+            poll_reply->shortname[18 - 1] = 0;
             poll_reply->longname[64 - 1] = 0;
             poll_reply->nodereport[64 - 1] = 0;
             auto new_dev = std::make_shared<shznet_artnet_device>(this, art_adr, (char*)poll_reply->shortname, (char*)poll_reply->longname);
@@ -4717,16 +4580,9 @@ public:
             m_udp.send_packet_artnet(adr, (uint8_t*)&art_poll, sizeof(artnet_poll));
         }
 
-        if (m_udp.local_adr().ip.port != ART_NET_PORT)
-        {
-            shznet_ip adr2(m_udp.local_adr().ip.port);
-            m_udp.send_packet_artnet(adr2, (uint8_t*)&art_poll, sizeof(artnet_poll));
-
-        }
-
 #ifdef _WIN32
         {
-            shznet_ip adr((short)ART_NET_PORT);
+            shznet_ip adr((short)SHZNET_CLIENT_PORT);
             adr.ip[0] = 127;
             adr.ip[1] = 0;
             adr.ip[2] = 0;
@@ -4768,9 +4624,10 @@ public:
 
         uint32_t pkt_size = m_send_buffer.packet_end();
 
+        //Check client subports
         if (!m_poll_broadcast_subnet_switch)
         {
-            shznet_ip adr((short)ART_NET_PORT);
+            shznet_ip adr((short)SHZNET_CLIENT_PORT);
             if (!m_udp.send_packet_to_interface(adr, (uint8_t*)&m_send_buffer, pkt_size))
                 m_udp.send_packet(adr, (uint8_t*)&m_send_buffer, pkt_size);
         }
@@ -4778,25 +4635,43 @@ public:
         {
             shznet_ip adr = local_ip();
             adr.ip[3] = 255;
-            adr.port = ART_NET_PORT;
+            adr.port = SHZNET_CLIENT_PORT;
             if (!m_udp.send_packet_to_interface(adr, (uint8_t*)&m_send_buffer, pkt_size))
                 m_udp.send_packet(adr, (uint8_t*)&m_send_buffer, pkt_size);
         }
 
-        if (m_udp.local_adr().ip.port != ART_NET_PORT)
+        //Check other servers
+        if (!m_poll_broadcast_subnet_switch)
         {
-            shznet_ip adr((short)ART_NET_PORT);
-            adr.port = m_udp.local_adr().ip.port;
+            shznet_ip adr((short)SHZNET_SERVER_PORT);
             if (!m_udp.send_packet_to_interface(adr, (uint8_t*)&m_send_buffer, pkt_size))
                 m_udp.send_packet(adr, (uint8_t*)&m_send_buffer, pkt_size);
-            int port_delta = m_udp.local_adr().ip.port - ART_NET_PORT;
-            if (port_delta > 1)
+        }
+        else
+        {
+            shznet_ip adr = local_ip();
+            adr.ip[3] = 255;
+            adr.port = SHZNET_SERVER_PORT;
+            if (!m_udp.send_packet_to_interface(adr, (uint8_t*)&m_send_buffer, pkt_size))
+                m_udp.send_packet(adr, (uint8_t*)&m_send_buffer, pkt_size);
+        }
+
+        //If we have a different port, also check this
+        if (m_udp.local_adr().ip.port != SHZNET_SERVER_PORT)
+        {
+            if (!m_poll_broadcast_subnet_switch)
             {
-                adr.port = ART_NET_PORT + m_poll_probe;
+                shznet_ip adr((short)m_udp.local_adr().ip.port);
                 if (!m_udp.send_packet_to_interface(adr, (uint8_t*)&m_send_buffer, pkt_size))
                     m_udp.send_packet(adr, (uint8_t*)&m_send_buffer, pkt_size);
-                m_poll_probe++;
-                if (m_poll_probe >= port_delta) m_poll_probe = 1;
+            }
+            else
+            {
+                shznet_ip adr = local_ip();
+                adr.ip[3] = 255;
+                adr.port = m_udp.local_adr().ip.port;
+                if (!m_udp.send_packet_to_interface(adr, (uint8_t*)&m_send_buffer, pkt_size))
+                    m_udp.send_packet(adr, (uint8_t*)&m_send_buffer, pkt_size);
             }
         }
     }
@@ -4807,7 +4682,7 @@ public:
         if (is_broadcast) m_send_buffer.packet_set_broadcast();
         m_send_buffer.packet_set_data((byte*)this->m_nodename.c_str(), std::min((size_t)128, this->m_nodename.size()));
         uint32_t pkt_size = m_send_buffer.packet_end();
-        if(!m_udp.send_packet_to_interface(adr.ip, (uint8_t*)&m_send_buffer, pkt_size))
+        if (!m_udp.send_packet_to_interface(adr.ip, (uint8_t*)&m_send_buffer, pkt_size))
             m_udp.send_buffered(adr.ip, (uint8_t*)&m_send_buffer, pkt_size);
     }
 
@@ -4819,7 +4694,7 @@ public:
         memcpy(art_dmx_buffer.data, data, len);
         int total_size = ART_DMX_START + art_dmx_buffer.length;
         art_dmx_buffer.length = reverse_bits<short>(art_dmx_buffer.length);
-        m_udp.send_packet_artnet(adr, (byte*) & art_dmx_buffer, total_size);
+        m_udp.send_packet_artnet(adr, (byte*)&art_dmx_buffer, total_size);
     }
 
     //low level API
@@ -4924,6 +4799,157 @@ public:
             return 0;
         return it->second;
     }
+
+    //Can also be used to refresh the command list of devices.
+    void send_init_connection(shznet_device_ptr dev_ptr)
+    {
+        uint32_t receive_cmd_defs = /*!is_client_only*/true;
+
+        dev_ptr->send_get(
+            SHZNET_TEST_CMD,
+            (byte*)&receive_cmd_defs, sizeof(receive_cmd_defs),
+            SHZNET_PKT_FMT_INT32,
+            [this, dev_ptr, receive_cmd_defs](byte* data, size_t size, shznet_pkt_dataformat fmt, bool success) {
+                if (!success || !size) {
+                    //disconnect_device(dev_ptr->get_mac(), "init connection failed.");
+                    NETPRNT("init connection failed.");
+                    SHIZONETLOG("%s Init connection failed!\n", dev_ptr->get_name().c_str());
+                    if (dev_ptr->_init_connection_attempts < 3)
+                    {
+                        NETPRNT("retrying...");
+                        bool fix_me = false;
+                        for (auto& it : check_device_connections) {
+                            if (it.get() == dev_ptr.get()) {
+                                fix_me = true;
+                                break;
+                            }
+                        }
+                        if (!fix_me) {
+                            check_device_connections.push_back(dev_ptr);
+                            dev_ptr->_init_connection_attempts++;
+                        }
+                    }
+                    else
+                    {
+                        NETPRNT("disconnecting device...");
+                        disconnect_device(dev_ptr->get_mac(), "init connection failed.");
+                    }
+                    return;
+                }
+
+                dev_ptr->command_map.clear();
+                dev_ptr->command_response_map.clear();
+                dev_ptr->network_buffers_static.clear();
+                dev_ptr->network_buffers_static_list.clear();
+                dev_ptr->network_buffers_static_list_leds.clear();
+                dev_ptr->network_buffers_static_list_data.clear();
+
+                shznet_kv_reader kvr(data, size);
+
+                if (!kvr.read()) {
+                    disconnect_device(dev_ptr->get_mac(), "init connection failed (invalid kv).");
+                    return;
+                }
+
+                if (kvr.get_value_size() != sizeof(uint32_t)) {
+                    disconnect_device(dev_ptr->get_mac(), "init connection failed (invalid kv version size).");
+                    return;
+                }
+
+                //This is kinda ugly and we could do better, but keep it for now for compatibility (deprecated, use kvr.read_int32() in future)
+                auto version = *(uint32_t*)kvr.get_value();
+
+                if (version != 1)
+                {
+                    auto cmds = kvr.read_kv("commands");
+                    while (cmds.read())
+                    {
+                        shznet_command_defs* def = (shznet_command_defs*)cmds.get_value();
+                        if (def && cmds.get_value_size() == sizeof(shznet_command_defs))
+                        {
+                            if (!def->type) {
+                                dev_ptr->command_map[def->hash] = cmds.get_key();
+                            }
+                            else {
+                                dev_ptr->command_response_map[def->hash] = cmds.get_key();
+                            }
+                        }
+                    }
+
+                    auto buffers = kvr.read_kv("static_buffers");
+                    auto buffer_desc = kvr.read_kv("static_buffers_desc");
+                    auto buffer_setups = kvr.read_kv("static_buffers_setup");
+
+                    while (buffers.read())
+                    {
+                        shznet_buffer_defs* def = (shznet_buffer_defs*)buffers.get_value();
+                        if (def && buffers.get_value_size() == sizeof(shznet_buffer_defs))
+                        {
+                            //GCC fix
+                            auto def_type = def->type;
+                            auto def_size = def->size;
+
+                            dev_ptr->network_buffers_static[def->hash] = std::make_shared<shznet_device::network_buffer_static_s>(
+                                buffers.get_key(),
+                                (network_buffer_static_type)def_type,
+                                def_size,
+                                buffer_desc.read_string(buffers.get_key()),
+                                buffer_setups.read_string(buffers.get_key())
+                            );
+
+                            dev_ptr->network_buffers_static_list.push_back(dev_ptr->network_buffers_static[def->hash]);
+
+                            if (def->type == network_buffer_static_type::NETWORK_BUFFER_STATIC_DATA)
+                                dev_ptr->network_buffers_static_list_data.push_back(dev_ptr->network_buffers_static[def->hash]);
+                            else if (def->type >= NETWORK_BUFFER_STATIC_LEDS_1CH && def->type <= NETWORK_BUFFER_STATIC_LEDS_4CH)
+                                dev_ptr->network_buffers_static_list_leds.push_back(dev_ptr->network_buffers_static[def->hash]);
+
+                        }
+                    }
+
+                    SHIZONETLOG("%s has %i cmds and %i buffers (%i).\n", dev_ptr->get_name().c_str(), (int)(dev_ptr->command_map.size() + dev_ptr->command_response_map.size()), (int)dev_ptr->network_buffers_static_list.size(), (int)size);
+
+#ifdef ARDUINO
+                    Serial.printf("%s has %i cmds and %i buffers.\n", dev_ptr->get_name().c_str(), (int)(dev_ptr->command_map.size() + dev_ptr->command_response_map.size()), (int)dev_ptr->network_buffers_static_list.size());
+#endif
+
+                }
+                else //old compatibility
+                {
+                    while (kvr.read()) {
+                        if (kvr.get_value_size() != sizeof(shznet_command_defs)) {
+                            NETPRNT("command def invalid size!");
+                            continue;
+                        }
+                        shznet_command_defs* def = (shznet_command_defs*)kvr.get_value();
+                        if (!def->type) {
+                            dev_ptr->command_map[def->hash] = kvr.get_key();
+                        }
+                        else {
+                            dev_ptr->command_response_map[def->hash] = kvr.get_key();
+                        }
+                    }
+                }
+
+                dev_ptr->_has_shizoscript_json = kvr.read_int32("has_json");
+                dev_ptr->_has_shizoscript_json_v3 = kvr.read_int32("has_json_v3");
+
+                dev_ptr->max_packets_before_pacing = kvr.read_int32("pacing");
+
+                dev_ptr->received_state = true;
+
+                if (dev_ptr->was_connected)
+                    return;
+
+                dev_ptr->was_connected = true;
+
+                SHIZONETLOG("\n%s CONNECTION ESTABLISHED!\n", dev_ptr->get_name().c_str());
+
+                finalize_device_connections.push_back(dev_ptr);
+            },
+            1000 * 15
+        );
+    }
 };
 
 //TODO: should it work someday, merge it back with the shznet_base_impl class directly
@@ -4932,7 +4958,7 @@ class shznet_responder
 {
     shznet_device_ptr _device;
     shznet_ticketid _id;
-    byte*           _data;
+    byte* _data;
     size_t          _size;
     shznet_pkt_dataformat _fmt;
 
@@ -4951,7 +4977,7 @@ class shznet_responder
 
 public:
 
-    shznet_responder(shznet_device_ptr _dev, shznet_ticketid _id, byte* _data, size_t _size, shznet_pkt_dataformat _fmt) : _device(_dev), _id(_id), _data(_data), _size(_size), _fmt(_fmt) { 
+    shznet_responder(shznet_device_ptr _dev, shznet_ticketid _id, byte* _data, size_t _size, shznet_pkt_dataformat _fmt) : _device(_dev), _id(_id), _data(_data), _size(_size), _fmt(_fmt) {
         _dev->_active_responses.emplace(_id);
     }
 
@@ -4999,7 +5025,7 @@ public:
 
     ~shznet_responder()
     {
-        if(_device->_active_responses.contains(_id))
+        if (_device->_active_responses.contains(_id))
             _device->_active_responses.erase(_id);
         if (!has_responded)
         {
@@ -5022,7 +5048,7 @@ class shznet_base : public shznet_base_impl
     struct network_buffer_static_s
     {
         network_buffer_static_type type;
-        byte*   data;
+        byte* data;
         size_t  size;
         std::string description;
         std::string setup;
@@ -5030,10 +5056,10 @@ class shznet_base : public shznet_base_impl
 
 protected:
     friend class shznet_device;
-    
+
     //local stuff
     std::vector<std::unique_ptr<pending_device_respond_msg>> m_pending_device_responds; //this is used in case another device sends a respond request but is not yet connected to us, execute as soon as it is connected!
-   
+
     std::unordered_map<uint32_t, std::function<void(std::shared_ptr<shznet_responder>)>>    m_response_callbacks;
     std::unordered_map<uint32_t, std::string>                                               m_response_command_names;
     std::unordered_map<uint32_t, network_buffer_static_s>                                   m_network_buffers_static;
@@ -5055,6 +5081,7 @@ protected:
     shznet_kv_writer kvw;
 
     bool _has_shizoscript_json = false;
+    bool _has_shizoscript_json_v3 = false;
 
 #ifdef ESP32_OTA_NAME
     esp_ota_handle_t ota_update_handle = -1;
@@ -5104,7 +5131,7 @@ public:
     shznet_base()
     {
         add_command(SHZNET_TEST_INIT_CMD, [this](shznet_ip& ip, byte* data, size_t size, shznet_pkt_header& hdr)
-            {                
+            {
                 auto dev = find_device(hdr.macid_source);
 
                 shznet_adr adr(ip.ip, hdr.macid_source, ip.port);
@@ -5164,7 +5191,7 @@ public:
                 auto dev = find_device(hdr.macid_source);
                 shznet_adr adr(ip.ip, hdr.macid_source, ip.port);
 
-                
+
                 if (dev)
                 {
                     SHIZONETLOG("%s [LOCAL] %s init command response!\n", adr.mac.str().c_str(), dev->get_name().c_str());
@@ -5183,6 +5210,7 @@ public:
 
                 kvw.add_int32("version", SHZNET_COMPAT_VERSION);
                 kvw.add_int32("has_json", _has_shizoscript_json);
+                kvw.add_int32("has_json_v3", _has_shizoscript_json_v3);
                 kvw.add_int32("pacing", SHZNET_PACKET_PACING_COUNT);
 
                 uint32_t send_cmd_defs = 1;
@@ -5254,9 +5282,9 @@ public:
                     SHIZONETLOG("%s test command response invalid!\n", adr.mac.str().c_str());
                     return;
                 }
-               
+
                 //SHIZONETLOG("%s test command response!\n", adr.mac.str().c_str());
-                
+
                 uint32_t cmd_hash = *(uint32_t*)&data[0];
 
                 data += sizeof(uint32_t);
@@ -5303,7 +5331,7 @@ public:
                     shznet_kv_writer writer;
                     writer.add_int64("ticketid", check_ticket_id);
                     writer.add_int32("result", 0);
-                    
+
                     m_send_buffer.packet_begin(SHZNET_PKT_OOB, local_mac(), adr.mac, get_new_ticketid(), hdr.sessionid);
                     m_send_buffer.packet_set_cmd((char*)SHZNET_RESPONSE_CMD_CHECK_ANSWER);
                     m_send_buffer.packet_set_data(writer.get_buffer().data(), writer.get_buffer().size());
@@ -5362,7 +5390,7 @@ public:
                     {
                         auto cb = it->cb;
                         it = m_wait_responses.erase(it);
-                        cb(data, size, hdr.data_format, false);                     
+                        cb(data, size, hdr.data_format, false);
                         break;
                     }
                     else
@@ -5429,7 +5457,7 @@ public:
         add_command("SHZSET_STATIC_BUFFER", [this](shznet_ip& ip, byte* data, size_t size, shznet_pkt_header& hdr)
             {
                 shznet_kv_reader reader(data, size);
-            
+
                 if (!reader.read())
                     return;
 
@@ -5459,7 +5487,7 @@ public:
                     if (nb == m_network_buffers_static.end())
                         break;
 
-                    auto &nbs = nb->second;
+                    auto& nbs = nb->second;
 
                     if (start_chunk * 256 + payload_size <= nbs.size)
                     {
@@ -5497,7 +5525,7 @@ public:
                     }
                 }
             });
-        
+
         add_command("SHZDIAG_STATIC_BUFFER", [this](shznet_ip& ip, byte* data, size_t size, shznet_pkt_header& hdr)
             {
                 shznet_kv_reader reader(data, size);
@@ -5529,7 +5557,7 @@ public:
                     printf(msg.c_str());
 #endif
                 }
-                
+
             });
 
 
@@ -5555,8 +5583,8 @@ public:
                 }
 
                 uint32_t size = 0;
-                
-                if(responder->data() && responder->size() == sizeof(uint32_t))
+
+                if (responder->data() && responder->size() == sizeof(uint32_t))
                     size = *(uint32_t*)responder->data();
                 else if (responder->data() && responder->size() == sizeof(uint64_t))
                     size = *(uint64_t*)responder->data();
@@ -5567,7 +5595,7 @@ public:
                 Serial.print("OTA begin with size: ");
                 Serial.println(size);
                 esp_err_t err = esp_ota_begin(ota_update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_update_handle);
-                
+
                 if (err != ESP_OK) {
                     kvw.add_int32("success", 0);
                     kvw.add_string("error", "OTA begin error.");
@@ -5633,7 +5661,7 @@ public:
                 //Serial.println("OTA CHUNK");
                 auto err = esp_ota_write(ota_update_handle, responder->data(), responder->size());
                 if (err != ESP_OK)
-                    kvw.add_int32("success", 0);              
+                    kvw.add_int32("success", 0);
                 else
                     kvw.add_int32("success", 1);
 
@@ -5644,11 +5672,11 @@ public:
             {
                 //Serial.println("OTA ENABLE TEST");
                 kvw.clear();
-                
+
                 uint8_t sha_256[32] = { 0 };
-                
+
                 get_running_firmware_sha256(sha_256);
-                
+
                 // Convert sha_256 byte array to a hex string
                 char sha_str[65] = { 0 }; // 32 bytes * 2 characters + 1 for null terminator
                 for (int i = 0; i < 32; i++) {
@@ -5795,7 +5823,7 @@ protected:
             {
                 auto cb = it->cb;
                 it = m_wait_responses.erase(it);
-                if(cb) cb(0, 0, SHZNET_PKT_FMT_INVALID, 0);
+                if (cb) cb(0, 0, SHZNET_PKT_FMT_INVALID, 0);
                 break;
             }
             else
@@ -5820,7 +5848,7 @@ protected:
 
         for (auto& it : m_wait_responses_tmp2)
         {
-            if(it.cb) it.cb(0, 0, SHZNET_PKT_FMT_INVALID, 0);
+            if (it.cb) it.cb(0, 0, SHZNET_PKT_FMT_INVALID, 0);
         }
     }
 };
@@ -5845,7 +5873,7 @@ public:
 
     shznet_server() : shznet_base()
     {
-  
+
     }
 
     virtual ~shznet_server() { m_udp.invalidate_threads(); }
@@ -5857,7 +5885,7 @@ public:
         {
             send_art_poll();
 
-            if(m_shizonet_enabled)
+            if (m_shizonet_enabled)
                 send_shz_poll();
 
             //m_poll_broadcast_subnet_switch ^= 1;
@@ -5865,9 +5893,9 @@ public:
             /*
             shznet_ip broadcast(m_udp.local_adr().ip.port);
             send_art_poll_reply(broadcast);
-            if (broadcast.port != ART_NET_PORT)
+            if (broadcast.port != SHZNET_CLIENT_PORT)
             {
-                broadcast.port = ART_NET_PORT;
+                broadcast.port = SHZNET_CLIENT_PORT;
                 send_art_poll_reply(broadcast);
             }
             */

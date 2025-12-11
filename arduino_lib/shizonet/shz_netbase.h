@@ -227,15 +227,45 @@ static shznet_ticketid var_to_device(const char* cmd, shzvar* var, shznet_device
 		}*/
 	case SHZVAR_JSON:
 	{
-		auto jh = var->get_json();
-		static uchar_array_s _tmp;
-		_tmp.clear();
-		jh->to_data(_tmp);
+		if (device->_has_shizoscript_json)
+		{
+			auto jh = var->get_json();
+			static uchar_array_s _tmp;
+			_tmp.clear();
+			jh->to_data(_tmp);
 
-		send_id = (device->send_reliable(cmd,
-			(byte*)_tmp.data(),
-			_tmp.size(),
-			SHZNET_PKT_FMT_JSON, sequential, timeout));
+			send_id = (device->send_reliable(cmd,
+				(byte*)_tmp.data(),
+				_tmp.size(),
+				SHZNET_PKT_FMT_JSON, sequential, timeout));
+		}
+		else
+		{
+			auto jh = var->get_json();
+			auto kvw = shznet_kv_writer();
+			for (auto it : jh->jsons)
+			{
+				if (!it->key.allocated() || it->key.get().empty())
+				{
+					SLH_Instance()->logerror("Cannot send empty keys (lists)!");
+					continue;
+				}
+
+				if (it->is_int())
+					kvw.add_int64(it->key.get().c_str(), it->get_int());
+				else if (it->is_float())
+					kvw.add_float64(it->key.get().c_str(), it->get_float());
+				else if (it->is_string())
+					kvw.add_string(it->key.get().c_str(), it->get_string_cptr());
+				else if (it->is_data())
+					kvw.add_data(it->key.get().c_str(), it->get_uchar_array()->data(), it->get_uchar_array()->size());
+				//TODO: add json case, recursively shznet_kv_writer (sub objects not supported yet otherwise)
+			}
+			send_id = (device->send_reliable(cmd,
+				(byte*)kvw.get_buffer().data(),
+				kvw.get_buffer().size(),
+				SHZNET_PKT_FMT_KEY_VALUE, sequential, timeout));
+		}
 		break;
 	}
 	case SHZVAR_CHAR_ARRAY:
@@ -315,15 +345,45 @@ static void var_to_responder(shzvar* var, std::shared_ptr<shznet_responder>& res
 		}*/
 	case SHZVAR_JSON:
 	{
-		auto jh = var->get_json();
-		static uchar_array_s _tmp;
-		_tmp.clear();
-		jh->to_data(_tmp);
+		if (responder->device_ptr()->_has_shizoscript_json)
+		{
+			auto jh = var->get_json();
+			static uchar_array_s _tmp;
+			_tmp.clear();
+			jh->to_data(_tmp);
 
-		responder->respond(
-			(byte*)_tmp.data(),
-			_tmp.size(),
-			SHZNET_PKT_FMT_JSON);
+			responder->respond(
+				(byte*)_tmp.data(),
+				_tmp.size(),
+				SHZNET_PKT_FMT_JSON);
+		}
+		else
+		{
+			auto jh = var->get_json();
+			auto kvw = shznet_kv_writer();
+			for (auto it : jh->jsons)
+			{
+				if (!it->key.allocated() || it->key.get().empty())
+				{
+					SLH_Instance()->logerror("Cannot send empty keys (lists)!");
+					continue;
+				}
+
+				if (it->is_int())
+					kvw.add_int64(it->key.get().c_str(), it->get_int());
+				else if (it->is_float())
+					kvw.add_float64(it->key.get().c_str(), it->get_float());
+				else if (it->is_string())
+					kvw.add_string(it->key.get().c_str(), it->get_string_cptr());
+				else if (it->is_data())
+					kvw.add_data(it->key.get().c_str(), it->get_uchar_array()->data(), it->get_uchar_array()->size());
+				//TODO: add json case, recursively shznet_kv_writer (sub objects not supported yet otherwise)
+			}
+			responder->respond(
+				(byte*)kvw.get_buffer().data(),
+				kvw.get_buffer().size(),
+				SHZNET_PKT_FMT_KEY_VALUE);
+		}
 		break;
 	}
 	case SHZVAR_CHAR_ARRAY:
@@ -436,8 +496,8 @@ public:
 				for (auto& it : names)
 				{
 					auto sub = jh->push_var(SHZ_STR(it))->get_json(true);
-					sub->push_string(SHZ_STR(obj->m_device->get_static_buffer_desc(it)), "description");
-					sub->push_string(SHZ_STR(obj->m_device->get_static_buffer_setup(it)), "setup");
+					sub->push_string(shzstring(obj->m_device->get_static_buffer_desc(it)), "description");
+					sub->push_string(shzstring(obj->m_device->get_static_buffer_setup(it)), "setup");
 					sub->push_int(obj->m_device->get_static_buffer_size(it), "size");
 
 					switch (obj->m_device->get_static_buffer_type(it))
@@ -470,14 +530,14 @@ public:
 
 				if (params[0]->is_int() || params[0]->is_float())
 				{
-					jh->push_string(SHZ_STR(obj->m_device->get_static_buffer_desc(params[0]->get_int())), "description");
-					jh->push_string(SHZ_STR(obj->m_device->get_static_buffer_setup(params[0]->get_int())), "setup");
+					jh->push_string(shzstring(obj->m_device->get_static_buffer_desc(params[0]->get_int())), "description");
+					jh->push_string(shzstring(obj->m_device->get_static_buffer_setup(params[0]->get_int())), "setup");
 				}
 				else
 				{
 					std::string buffer_name = SHZ_STR(params[0]->get_string());
-					jh->push_string(SHZ_STR(obj->m_device->get_static_buffer_desc(buffer_name)), "description");
-					jh->push_string(SHZ_STR(obj->m_device->get_static_buffer_setup(buffer_name)), "setup");
+					jh->push_string(shzstring(obj->m_device->get_static_buffer_desc(buffer_name)), "description");
+					jh->push_string(shzstring(obj->m_device->get_static_buffer_setup(buffer_name)), "setup");
 				}
 
 			}, 1, true, false, "(index|name)");
@@ -553,16 +613,48 @@ public:
 					}*/
 				case SHZVAR_JSON:
 				{
-					auto jh = params[1]->get_json();
-					static uchar_array_s _tmp;
-					_tmp.clear();
-					jh->to_data(_tmp);
+					if (obj->m_device->_has_shizoscript_json)
+					{
+						auto jh = params[1]->get_json();
+						static uchar_array_s _tmp;
+						_tmp.clear();
+						jh->to_data(_tmp);
 
-					if (obj->m_device->send_unreliable(cmd,
-						(byte*)_tmp.data(),
-						_tmp.size(),
-						SHZNET_PKT_FMT_JSON))
-						result.initInt(1);
+						if (obj->m_device->send_unreliable(cmd,
+							(byte*)_tmp.data(),
+							_tmp.size(),
+							SHZNET_PKT_FMT_JSON))
+							result.initInt(1);
+					}
+					else
+					{
+						auto jh = params[1]->get_json();
+						auto kvw = shznet_kv_writer();
+						for (auto it : jh->jsons)
+						{
+							if (!it->key.allocated() || it->key.get().empty())
+							{
+								SLH_Instance()->logerror("Cannot send empty keys (lists)!");
+								continue;
+							}
+
+							if (it->is_int())
+								kvw.add_int64(it->key.get().c_str(), it->get_int());
+							else if (it->is_float())
+								kvw.add_float64(it->key.get().c_str(), it->get_float());
+							else if (it->is_string())
+								kvw.add_string(it->key.get().c_str(), it->get_string_cptr());
+							else if (it->is_data())
+								kvw.add_data(it->key.get().c_str(), it->get_uchar_array()->data(), it->get_uchar_array()->size());
+							//TODO: add json case, recursively shznet_kv_writer (sub objects not supported yet otherwise)
+						}
+						if (obj->m_device->send_unreliable(cmd,
+							(byte*)kvw.get_buffer().data(),
+							kvw.get_buffer().size(),
+							SHZNET_PKT_FMT_KEY_VALUE))
+							result.initInt(1);
+					}
+
 					break;
 				}
 				case SHZVAR_CHAR_ARRAY:
@@ -2036,7 +2128,7 @@ public:
 
 				for (auto& it : obj->m_devices)
 				{
-					if (it.second->command_response_map.find(cmd_hash) != it.second->command_response_map.end())
+					if (it.second->received_state && it.second->command_response_map.find(cmd_hash) != it.second->command_response_map.end())
 					{
 						dev = it.second;
 						break;

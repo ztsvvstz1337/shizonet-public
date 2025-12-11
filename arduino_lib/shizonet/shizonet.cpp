@@ -13,7 +13,7 @@ void* shznet_malloc(size_t size)
 {
 #ifdef ARDUINO_ARCH_ESP32
     //check here if we have free SRAM, try to allocate stuff there first
-    if (psramInit() && ((ESP.getFreeHeap()+size) < 1024 * 100))
+    if (psramInit() && ((ESP.getFreeHeap() + size) < 1024 * 100))
         return ps_malloc(size);
 #endif
     return malloc(size);
@@ -136,7 +136,7 @@ void shznet_device::flush_send_buffers()
 
 shznet_ticketid shznet_device::send_get(const char* cmd, byte* data, size_t size, shznet_pkt_dataformat fmt, shznet_response_callback cb, uint64_t timeout)
 {
-    auto tid = send_response(SHZNET_RESPONSE_CMD, shznet_hash((char*)cmd,strlen(cmd)), data, size, fmt, true);
+    auto tid = send_response(SHZNET_RESPONSE_CMD, shznet_hash((char*)cmd, strlen(cmd)), data, size, fmt, true);
     if (tid != INVALID_TICKETID)
     {
         base->handle_response_add(shznet_base_impl::response_wait(tid, get_mac(), cb, timeout));
@@ -431,6 +431,28 @@ shznet_ticketid shznet_global_s::get_new_ticketid()
 #endif
 
 #define XXH_INLINE_ALL
+#define XXH_STATIC_LINKING_ONLY
+#define XXH_FORCE_MEMORY_ACCESS 2
+#define XXH_NO_STDLIB
+
+#ifndef ARDUINO
+
+#if !defined(XXH_VECTOR)
+/* ARM64 or ARMv7 → use NEON */
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) || defined(_M_ARM)
+#define XXH_VECTOR XXH_NEON
+
+/* x86 / x64 → use SSE2 */
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define XXH_VECTOR XXH_SSE2
+
+/* fallback → no SIMD */
+#else
+#define XXH_VECTOR XXH_SCALAR
+#endif
+
+#endif // !defined(XXH_VECTOR)
+#endif // ARDUINO
 #include "xxhash.h"
 
 uint32_t shznet_hash(char* data, size_t size)
@@ -513,12 +535,12 @@ void GenericOSUDPSocket::high_resolution_wait(uint32_t microseconds)
 #elif __linux__
 void GenericOSUDPSocket::start_high_resolution_timer()
 {
-   
+
 }
 
 void GenericOSUDPSocket::stop_high_resolution_timer()
 {
-   
+
 }
 
 void GenericOSUDPSocket::high_resolution_wait(uint32_t microseconds)

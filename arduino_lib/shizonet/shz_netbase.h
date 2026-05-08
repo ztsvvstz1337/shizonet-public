@@ -187,6 +187,48 @@ static void data_to_var(shznet_pkt_dataformat fmt, byte* data, size_t size, shzv
 	}
 }
 
+//Use with json vars only
+shznet_kv_writer shizovar_to_shizonet(shzvar* var)
+{
+	shznet_kv_writer w;
+
+	auto jh = var->get_json();
+
+	for (auto& it : jh->jsons)
+	{
+		const char* it_name = "";
+		if (it->key.allocated())
+		{
+			it_name = it->key.get().c_str();
+		}
+
+		switch (it->Type)
+		{
+		case SHZVAR_INT:
+			w.add_int64(it_name, it->get_int());
+			break;
+		case SHZVAR_FLOAT:
+			w.add_float64(it_name, it->get_float());
+			break;
+		case SHZVAR_STRING:
+			w.add_string(it_name, it->get_string_cptr());
+			break;
+		case SHZVAR_UCHAR_ARRAY:
+			w.add_data(it_name, it->get_uchar_array()->data(),
+				it->get_uchar_array()->size());
+		case SHZVAR_JSON:
+		{
+			auto sub_kv = shizovar_to_shizonet(it);
+			w.add_kv(it_name, sub_kv);
+			break;
+		}
+		}
+	}
+
+	return w;
+}
+
+
 static shznet_ticketid var_to_device(const char* cmd, shzvar* var, shznet_device* device, bool sequential, uint64_t timeout)
 {
 	shznet_ticketid send_id = -1;
@@ -240,27 +282,9 @@ static shznet_ticketid var_to_device(const char* cmd, shzvar* var, shznet_device
 				SHZNET_PKT_FMT_JSON, sequential, timeout));
 		}
 		else
-		{
-			auto jh = var->get_json();
-			auto kvw = shznet_kv_writer();
-			for (auto it : jh->jsons)
-			{
-				if (!it->key.allocated() || it->key.get().empty())
-				{
-					SLH_Instance()->logerror("Cannot send empty keys (lists)!");
-					continue;
-				}
+		{	
+			auto kvw = shizovar_to_shizonet(var);
 
-				if (it->is_int())
-					kvw.add_int64(it->key.get().c_str(), it->get_int());
-				else if (it->is_float())
-					kvw.add_float64(it->key.get().c_str(), it->get_float());
-				else if (it->is_string())
-					kvw.add_string(it->key.get().c_str(), it->get_string_cptr());
-				else if (it->is_data())
-					kvw.add_data(it->key.get().c_str(), it->get_uchar_array()->data(), it->get_uchar_array()->size());
-				//TODO: add json case, recursively shznet_kv_writer (sub objects not supported yet otherwise)
-			}
 			send_id = (device->send_reliable(cmd,
 				(byte*)kvw.get_buffer().data(),
 				kvw.get_buffer().size(),
@@ -359,26 +383,8 @@ static void var_to_responder(shzvar* var, std::shared_ptr<shznet_responder>& res
 		}
 		else
 		{
-			auto jh = var->get_json();
-			auto kvw = shznet_kv_writer();
-			for (auto it : jh->jsons)
-			{
-				if (!it->key.allocated() || it->key.get().empty())
-				{
-					SLH_Instance()->logerror("Cannot send empty keys (lists)!");
-					continue;
-				}
+			auto kvw = shizovar_to_shizonet(var);
 
-				if (it->is_int())
-					kvw.add_int64(it->key.get().c_str(), it->get_int());
-				else if (it->is_float())
-					kvw.add_float64(it->key.get().c_str(), it->get_float());
-				else if (it->is_string())
-					kvw.add_string(it->key.get().c_str(), it->get_string_cptr());
-				else if (it->is_data())
-					kvw.add_data(it->key.get().c_str(), it->get_uchar_array()->data(), it->get_uchar_array()->size());
-				//TODO: add json case, recursively shznet_kv_writer (sub objects not supported yet otherwise)
-			}
 			responder->respond(
 				(byte*)kvw.get_buffer().data(),
 				kvw.get_buffer().size(),
@@ -628,26 +634,8 @@ public:
 					}
 					else
 					{
-						auto jh = params[1]->get_json();
-						auto kvw = shznet_kv_writer();
-						for (auto it : jh->jsons)
-						{
-							if (!it->key.allocated() || it->key.get().empty())
-							{
-								SLH_Instance()->logerror("Cannot send empty keys (lists)!");
-								continue;
-							}
+						auto kvw = shizovar_to_shizonet(params[1]);
 
-							if (it->is_int())
-								kvw.add_int64(it->key.get().c_str(), it->get_int());
-							else if (it->is_float())
-								kvw.add_float64(it->key.get().c_str(), it->get_float());
-							else if (it->is_string())
-								kvw.add_string(it->key.get().c_str(), it->get_string_cptr());
-							else if (it->is_data())
-								kvw.add_data(it->key.get().c_str(), it->get_uchar_array()->data(), it->get_uchar_array()->size());
-							//TODO: add json case, recursively shznet_kv_writer (sub objects not supported yet otherwise)
-						}
 						if (obj->m_device->send_unreliable(cmd,
 							(byte*)kvw.get_buffer().data(),
 							kvw.get_buffer().size(),
@@ -844,26 +832,8 @@ public:
 				}
 				else
 				{
-					auto jh = params[1]->get_json();
-					auto kvw = shznet_kv_writer();
-					for (auto it : jh->jsons)
-					{
-						if (!it->key.allocated() || it->key.get().empty())
-						{
-							SLH_Instance()->logerror("Cannot send empty keys (lists)!");
-							continue;
-						}
+					auto kvw = shizovar_to_shizonet(params[1]);
 
-						if (it->is_int())
-							kvw.add_int64(it->key.get().c_str(), it->get_int());
-						else if (it->is_float())
-							kvw.add_float64(it->key.get().c_str(), it->get_float());
-						else if (it->is_string())
-							kvw.add_string(it->key.get().c_str(), it->get_string_cptr());
-						else if (it->is_data())
-							kvw.add_data(it->key.get().c_str(), it->get_uchar_array()->data(), it->get_uchar_array()->size());
-						//TODO: add json case, recursively shznet_kv_writer (sub objects not supported yet otherwise)
-					}
 					send_id = (obj->m_device->send_get(cmd,
 						(byte*)kvw.get_buffer().data(),
 						kvw.get_buffer().size(),
@@ -1014,26 +984,8 @@ public:
 					}
 					else
 					{
-						auto jh = params[1]->get_json();
-						auto kvw = shznet_kv_writer();
-						for (auto it : jh->jsons)
-						{
-							if (!it->key.allocated() || it->key.get().empty())
-							{
-								SLH_Instance()->logerror("Cannot send empty keys (lists)!");
-								continue;
-							}
+						auto kvw = shizovar_to_shizonet(params[1]);
 
-							if (it->is_int())
-								kvw.add_int64(it->key.get().c_str(), it->get_int());
-							else if (it->is_float())
-								kvw.add_float64(it->key.get().c_str(), it->get_float());
-							else if (it->is_string())
-								kvw.add_string(it->key.get().c_str(), it->get_string_cptr());
-							else if (it->is_data())
-								kvw.add_data(it->key.get().c_str(), it->get_uchar_array()->data(), it->get_uchar_array()->size());
-							//TODO: add json case, recursively shznet_kv_writer (sub objects not supported yet otherwise)
-						}
 						(obj->m_device->send_fetch(cmd,
 							(byte*)kvw.get_buffer().data(),
 							kvw.get_buffer().size(),
@@ -1564,7 +1516,7 @@ public:
 				if (params.size() != 1)
 					return;
 
-				obj->m_shizonet_enabled = params[0]->get_int();
+				obj->shizonet_enabled = params[0]->get_int();
 
 			}, 1, true, false, "(enable)");
 
@@ -2244,26 +2196,7 @@ public:
 					}
 					else
 					{
-						auto jh = params[1]->get_json();
-						auto kvw = shznet_kv_writer();
-						for (auto it : jh->jsons)
-						{
-							if (!it->key.allocated() || it->key.get().empty())
-							{
-								SLH_Instance()->logerror("Cannot send empty keys (lists)!");
-								continue;
-							}
-
-							if (it->is_int())
-								kvw.add_int64(it->key.get().c_str(), it->get_int());
-							else if (it->is_float())
-								kvw.add_float64(it->key.get().c_str(), it->get_float());
-							else if (it->is_string())
-								kvw.add_string(it->key.get().c_str(), it->get_string_cptr());
-							else if (it->is_data())
-								kvw.add_data(it->key.get().c_str(), it->get_uchar_array()->data(), it->get_uchar_array()->size());
-							//TODO: add json case, recursively shznet_kv_writer (sub objects not supported yet otherwise)
-						}
+						auto kvw = shizovar_to_shizonet(params[1]);
 
 						send_id = (dev->send_get(cmd,
 							(byte*)kvw.get_buffer().data(),
@@ -2720,7 +2653,7 @@ public:
 				if (params.size() != 1)
 					return;
 
-				obj->m_shizonet_enabled = params[0]->get_int();
+				obj->shizonet_enabled = params[0]->get_int();
 
 			}, 1, true, false, "(enable)");
 
@@ -3399,26 +3332,7 @@ public:
 					}
 					else
 					{
-						auto jh = params[1]->get_json();
-						auto kvw = shznet_kv_writer();
-						for (auto it : jh->jsons)
-						{
-							if (!it->key.allocated() || it->key.get().empty())
-							{
-								SLH_Instance()->logerror("Cannot send empty keys (lists)!");
-								continue;
-							}
-
-							if (it->is_int())
-								kvw.add_int64(it->key.get().c_str(), it->get_int());
-							else if (it->is_float())
-								kvw.add_float64(it->key.get().c_str(), it->get_float());
-							else if (it->is_string())
-								kvw.add_string(it->key.get().c_str(), it->get_string_cptr());
-							else if (it->is_data())
-								kvw.add_data(it->key.get().c_str(), it->get_uchar_array()->data(), it->get_uchar_array()->size());
-							//TODO: add json case, recursively shznet_kv_writer (sub objects not supported yet otherwise)
-						}
+						auto kvw = shizovar_to_shizonet(params[1]);
 
 						send_id = (dev->send_get(cmd,
 							(byte*)kvw.get_buffer().data(),

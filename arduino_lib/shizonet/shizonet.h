@@ -33,30 +33,36 @@
 #endif
 
 
-
-
 #ifdef ARDUINO_ARCH_ESP32
-#if defined(ESP_P4) || defined(ESP32_P4) //Stronger
-#define SHZNET_MAX_RECV (1024 * 1024) 
-#define SHZNET_MAX_RECV_BUFFERS (8) 
-#define SHZNET_MAX_RECV_OOB (1024 * 512) 
-#define SHZNET_PACKET_PACING_COUNT 8
-#else
-#define SHZNET_MAX_RECV (1024 * 50) //50kb
-#define SHZNET_MAX_RECV_BUFFERS (4) //3 Buffers (~30kb)
-#define SHZNET_MAX_RECV_OOB (1024 * 10) //10kb OOB data 
-#define SHZNET_PACKET_PACING_COUNT 1 //Send X packets at once and then wait for the microcontroller to process them before sending more
-                                    //This is based on the arduino pacing code which sends packets every 2 ms (to get 60 FPS at 16ms total window, sending 4*4 universes over that window)
-                                    //You can send a total of SHZNET_PACKET_PACING_COUNT * 4 per frame before it will start to lag (sadly RECVMSGBOXSIZE in ESP IDF is pretty low...)
-                                    //This value has been carefully trial and error'd, trying to get more data through the ESP by sending more packets
-                                    //is generally a bad idea, the only thing you can do is increase the payload on each packet to get more data thru
-#endif
-#else
-#define SHZNET_MAX_RECV (1024 * 1024 * 128) //128MB max at once
-#define SHZNET_MAX_RECV_BUFFERS (-1)
-#define SHZNET_MAX_RECV_OOB (1024 * 1024) //1mb OOB data 
+
+/* High-capacity configuration: any ESP32 with PSRAM */
+#if defined(BOARD_HAS_PSRAM) || defined(CONFIG_SPIRAM_SUPPORT)
+
+#define SHZNET_MAX_RECV          (1024 * 1024)     // 1 MB
+#define SHZNET_MAX_RECV_BUFFERS  (8)
+#define SHZNET_MAX_RECV_OOB      (1024 * 512)      // 512 KB
 #define SHZNET_PACKET_PACING_COUNT 0
-#endif
+
+/* Low-memory ESP32 (no PSRAM) */
+#else
+
+#define SHZNET_MAX_RECV          (1024 * 50)       // 50 KB
+#define SHZNET_MAX_RECV_BUFFERS  (4)
+#define SHZNET_MAX_RECV_OOB      (1024 * 10)       // 10 KB
+#define SHZNET_PACKET_PACING_COUNT 1
+#define SHZNET_LOW_RESOURCES
+
+#endif /* PSRAM */
+
+#else /* Non-ESP32 */
+
+#define SHZNET_MAX_RECV          (1024 * 1024 * 128) // 128 MB
+#define SHZNET_MAX_RECV_BUFFERS  (-1)
+#define SHZNET_MAX_RECV_OOB      (1024 * 1024)       // 1 MB
+#define SHZNET_PACKET_PACING_COUNT 0
+
+#endif /* ARDUINO_ARCH_ESP32 */
+
 
 #define INVALID_SESSIONID shznet_sessionid(-1)
 #define INVALID_TICKETID shznet_ticketid(-1)
@@ -71,12 +77,14 @@ struct shznet_config
     uint64_t max_recv_oob = SHZNET_MAX_RECV_OOB;
 };
 
+typedef shznet_vector<byte> shznet_order_buffer_data;
+
 struct shznet_channel_buffer
 {
     shznet_ticketid last_id = 0;
     uint32_t seq = 0;
     uint32_t max_seq = 0;
-    shznet_vector<byte> buffer;
+    shznet_order_buffer_data buffer;
 
     size_t data_index = 0;
 
@@ -87,10 +95,8 @@ struct shznet_channel_buffer
         max_seq = 0;
         buffer.clear();
         data_index = 0;
-#ifdef ARDUINO
-        //buffer.shrink_to_fit();
-#endif
     }
+
     void reset_seq(shznet_ticketid new_id)
     {
         last_id = new_id;
@@ -98,9 +104,6 @@ struct shznet_channel_buffer
         max_seq = 0;
         data_index = 0;
         buffer.clear();
-#ifdef ARDUINO
-        //buffer.shrink_to_fit();
-#endif
     }
 
     void write_data(byte* data, size_t size)
@@ -112,8 +115,6 @@ struct shznet_channel_buffer
     }
 
 };
-
-typedef shznet_vector<byte> shznet_order_buffer_data;
 
 struct shznet_order_buffer
 {
@@ -321,13 +322,15 @@ public:
         if (dmx_frame)
             delete dmx_frame;
 
-        while (true)
+#ifndef ARDUINO
+        while (async_commands.read())
         {
-            command_async_header async_hdr;
-            shznet_order_buffer_data* buff_data = (shznet_order_buffer_data*)async_commands.read(0, &async_hdr);
+            shznet_order_buffer_data* buff_data = *(shznet_order_buffer_data**)async_commands.read_data();
             if (!buff_data) break;
             delete buff_data;
+            async_commands.read_commit();
         }
+#endif
     }
 
     void set_node_name(std::string name)
@@ -473,35 +476,30 @@ public:
 
         int32_t max_packets_cc = 0;
 
-        while (true)
+#ifndef ARDUINO
+        while (async_commands.read())
         {
-            command_async_header async_hdr;
-            shznet_order_buffer_data* buff_data = (shznet_order_buffer_data*)async_commands.read_peek(0, &async_hdr);
-            if (!buff_data) break;
+            auto buff_data = *(shznet_order_buffer_data**)async_commands.read_data();
 
-            buff_data = *(shznet_order_buffer_data**)buff_data;
-
-            auto cb = m_callbacks.find(async_hdr.cmd);
+            auto cb = m_callbacks.find(async_commands.read_header().cmd);
             if (cb != m_callbacks.end())
-                cb->second(async_hdr.ip, buff_data->data(), buff_data->size(), async_hdr.header);
+            {
+                cb->second(async_commands.read_header().ip, buff_data->data(), buff_data->size(), async_commands.read_header().header);
+            }
             else
             {
                 NETPRNT("invalid cb!");
             }
 
-            async_commands.read();
             order_buffers_data.recycle(buff_data);
+            async_commands.read_commit();
 
             max_packets_cc++;
 
-#ifdef ARDUINO
-            if (max_packets_cc >= 32)
-                break;
-#else
             if (max_packets_cc >= 1024)
                 break;
-#endif
         }
+#endif
 
         max_packets_cc = 0;
 
@@ -592,9 +590,6 @@ public:
 
             if (m_missed_artnet_pkts)
             {
-#ifdef ARDUINO
-                Serial.print(m_missed_artnet_pkts); Serial.println(" missed artnet packets!");
-#endif
                 m_missed_artnet_pkts = 0;
             }
         }
@@ -1005,6 +1000,8 @@ public:
     //async threaded functions, can be called from recvthread on some platforms! not thread safe!
 
     //this is called from recv thread !!! when buffers are filled pass data to the main thread and clean up
+
+#ifndef ARDUINO
     struct command_async_header
     {
         shznet_ip ip;
@@ -1012,7 +1009,7 @@ public:
         uint32_t cmd;
     };
 
-    shznet_async_buffer_mpsc<sizeof(shznet_order_buffer_data*), MAX_ASYNC_ORDER_BUFFERS, command_async_header> async_commands;
+    shznet_async_buffer_spsc<sizeof(shznet_order_buffer_data*), MAX_ASYNC_ORDER_BUFFERS, command_async_header> async_commands;
     void push_generic_to_main_thread(shznet_ip& ip, shznet_pkt* pkt, shznet_order_buffer* buffer)
     {
         if (!buffer->data)
@@ -1030,10 +1027,12 @@ public:
         if (!async_commands.write((byte*)&buffer->data, sizeof(shznet_order_buffer*), &hdr))
         {
             SHIZONETLOG("%s Input packet overflow!\n", "error");
+            order_buffers_data.recycle(buffer->data);
         }
 
         buffer->data = 0;
     }
+#endif
 
     virtual void handle_shizonet_generic(shznet_ip& adr, shznet_pkt* pkt)
     {
@@ -1291,7 +1290,27 @@ public:
 
 
                     buff->complete = true;
+#ifndef ARDUINO
                     push_generic_to_main_thread(adr, pkt, buff);
+#else
+                    auto cb = m_callbacks.find(pkt->header.cmd_hash);
+                    if (cb != m_callbacks.end())
+                    {
+                        cb->second(adr,
+                            buff->data ? buff->data->data() : 0,
+                            buff->data ? buff->data->size() : 0,
+                            pkt->header);
+                    }
+                    else
+                    {
+                        NETPRNT("invalid cb!");
+                    }
+                    if (buff->data)
+                    {
+                        order_buffers_data.recycle(buff->data);
+                        buff->data = 0;
+                    }
+#endif
 
                     shznet_pkt_ack ack;
                     ack.sessionid = pkt->header.sessionid;
@@ -1400,7 +1419,27 @@ public:
                 if (allTrue)
                 {
                     buff->complete = true;
+#ifndef ARDUINO
                     push_generic_to_main_thread(adr, pkt, buff);
+#else
+                    auto cb = m_callbacks.find(pkt->header.cmd_hash);
+                    if (cb != m_callbacks.end())
+                    {
+                        cb->second(adr,
+                            buff->data ? buff->data->data() : 0,
+                            buff->data ? buff->data->size() : 0,
+                            pkt->header);
+                    }
+                    else
+                    {
+                        NETPRNT("invalid cb!");
+                    }
+                    if (buff->data)
+                    {
+                        order_buffers_data.recycle(buff->data);
+                        buff->data = 0;
+                    }
+#endif
                 }
             }
         }
@@ -3276,14 +3315,14 @@ class shznet_artnet_device
     struct artnet_buffer_s
     {
         std::vector<byte> universe_buffer;
-        bool			  dirty[16];
+        uint32_t	      dirty_bytes[16];
         uint8_t           seq[16];
 
         artnet_buffer_s()
         {
             universe_buffer = std::vector<byte>(512 * 17); //+1 just in case someone buffer overruns
             memset(universe_buffer.data(), 0, universe_buffer.size());
-            memset(dirty, 0, 16);
+            memset(dirty_bytes, 0, 16 * sizeof(uint32_t));
             memset(seq, 0, 16);
         }
     };
@@ -3435,7 +3474,7 @@ public:
         if (set_dirty)
         {
             for (int i = 0; i < 16; i++)
-                artnet_buffer->dirty[i] = true;
+                artnet_buffer->dirty_bytes[i] = 512;
         }
     }
 
@@ -3478,7 +3517,7 @@ public:
         {
             if (universe + i >= 16)
                 break;
-            artnet_buffer->dirty[universe + i] = true;
+            artnet_buffer->dirty_bytes[universe + i] = std::min(512u, (uint32_t)((start_adr + bytes_written) - (i * 512)));
         }
     }
 
@@ -3500,9 +3539,9 @@ public:
             if (universe >= 16)
                 return;
 
-            artnet_buffer->dirty[universe] = true;
-
             size_t max_size = std::min((size_t)(dmx_max - start_adr), data_size);
+
+            artnet_buffer->dirty_bytes[universe] = max_size;
 
             memset(&artnet_buffer->universe_buffer.data()[universe * 512 + start_adr], data_value, max_size);
 
@@ -3544,10 +3583,10 @@ public:
         for (int cc = 0; cc < 4; cc++)
         {
             int idx = artnet_send_group * 4 + cc;
-            if (artnet_buffer->dirty[idx])
+            if (artnet_buffer->dirty_bytes[idx])
             {
-                artnet_buffer->dirty[idx] = false;
-                send_art_universe(idx, &artnet_buffer->universe_buffer.data()[idx * 512], 512, artnet_buffer->seq[idx]++);
+                send_art_universe(idx, &artnet_buffer->universe_buffer.data()[idx * 512], artnet_buffer->dirty_bytes[idx], artnet_buffer->seq[idx]++);
+                artnet_buffer->dirty_bytes[idx] = 0;
             }
         }
     }
@@ -3712,13 +3751,10 @@ protected:
 
     int             m_poll_probe = 1; //for different PORTS
 
-    bool            send_artnet_sync = true;
     int             artnet_send_group = 0;
     shznet_timer    artnet_delay = shznet_timer(2); //target to send 16 universes at 60 FPS with 4 universes every 2-4 milliseconds
     //Really not sure what the right value would be for this as this depends on the device + the OS actually sending data...
     //2 seems to work fine with esp32, 3 would be a good middle ground and 4 is the max this value should ever be.
-
-    bool            m_shizonet_enabled = true;
 
     //This is not used yet, the correct way for this to work
     //would be to obtain all IP addresses from all interfaces
@@ -3728,6 +3764,10 @@ protected:
     bool is_client_only = false;
 
 public:
+
+    bool            shizonet_enabled = true;
+    bool            send_artnet_sync = true;
+
 
     shznet_base_impl()
     {
@@ -3777,7 +3817,7 @@ public:
     virtual void update() override
     {
 
-        if (m_shizonet_enabled)
+        if (shizonet_enabled)
         {
             if (check_device_connections.size() && check_device_timer.update())
             {
@@ -3824,7 +3864,7 @@ public:
 
         shznet_receiver::update();
 
-        if (m_shizonet_enabled && m_device_update.update())
+        if (shizonet_enabled && m_device_update.update())
         {
             /*for (auto it = m_artnet_devices.begin(); it != m_artnet_devices.end(); )
             {
@@ -3924,7 +3964,7 @@ public:
             }
         }
 
-        if (m_shizonet_enabled && m_wait_responses_timeout_check.update())
+        if (shizonet_enabled && m_wait_responses_timeout_check.update())
         {
             m_wait_responses_tmp.clear();
 
@@ -3996,7 +4036,7 @@ public:
             }
         }
 
-        if (m_shizonet_enabled)
+        if (shizonet_enabled)
         {
             //This may look weird but is just for safety if the update()
             //function somehow invalidates m_devices for whatever reason
@@ -4689,11 +4729,11 @@ public:
     void send_art_universe(shznet_ip& adr, uint16_t universe, byte* data, uint32_t len, uint8_t seq = 0)
     {
         art_dmx_buffer.universe = universe;
-        art_dmx_buffer.length = len > 512 ? 512 : len;
+        art_dmx_buffer.length = (len > 512 ? 512 : len);
         art_dmx_buffer.seq = seq;
         memcpy(art_dmx_buffer.data, data, len);
         int total_size = ART_DMX_START + art_dmx_buffer.length;
-        art_dmx_buffer.length = reverse_bits<short>(art_dmx_buffer.length);
+        art_dmx_buffer.length = ntohs(art_dmx_buffer.length);
         m_udp.send_packet_artnet(adr, (byte*)&art_dmx_buffer, total_size);
     }
 
@@ -4909,9 +4949,6 @@ public:
 
                     SHIZONETLOG("%s has %i cmds and %i buffers (%i).\n", dev_ptr->get_name().c_str(), (int)(dev_ptr->command_map.size() + dev_ptr->command_response_map.size()), (int)dev_ptr->network_buffers_static_list.size(), (int)size);
 
-#ifdef ARDUINO
-                    Serial.printf("%s has %i cmds and %i buffers.\n", dev_ptr->get_name().c_str(), (int)(dev_ptr->command_map.size() + dev_ptr->command_response_map.size()), (int)dev_ptr->network_buffers_static_list.size());
-#endif
 
                 }
                 else //old compatibility
@@ -5076,6 +5113,8 @@ protected:
 
         auto responder = std::make_shared<shznet_responder>(dev, id, data, size, fmt);
         it->second(responder);
+
+        //dev->send_response(SHZNET_RESPONSE_ACK_CMD_SUCCESS, id, 0, 0, SHZNET_PKT_FMT_INVALID);
     }
 
     shznet_kv_writer kvw;
@@ -5542,20 +5581,10 @@ public:
                 if (dev)
                 {
                     std::string msg = "Device " + dev->get_name() + " (" + dev->get_mac().str() + ") lost " + std::to_string(missing_pkts_count) + " pkts.\n";
-#ifdef ARDUINO
-                    Serial.println(msg.c_str());
-#else
-                    printf(msg.c_str());
-#endif
                 }
                 else
                 {
                     std::string msg = "Unknown Device lost " + std::to_string(missing_pkts_count) + " pkts.\n";
-#ifdef ARDUINO
-                    Serial.println(msg.c_str());
-#else
-                    printf(msg.c_str());
-#endif
                 }
 
             });
@@ -5621,7 +5650,7 @@ public:
                 {
                     auto err = esp_ota_end(ota_update_handle);
                     if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "OTA End failed: %s", esp_err_to_name(err));
+                        Serial.printf("OTA End failed: %s", esp_err_to_name(err));
                         kvw.add_int32("success", 0);
                         kvw.add_string("error", esp_err_to_name(err));
                         responder->respond(kvw);
@@ -5632,7 +5661,7 @@ public:
                     // Set boot partition and restart
                     err = esp_ota_set_boot_partition(ota_update_partition);
                     if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "Setting boot partition failed: %s", esp_err_to_name(err));
+                        Serial.printf("Setting boot partition failed: %s", esp_err_to_name(err));
                         kvw.add_int32("success", 0);
                         kvw.add_string("error", esp_err_to_name(err));
                         responder->respond(kvw);
@@ -5885,7 +5914,7 @@ public:
         {
             send_art_poll();
 
-            if (m_shizonet_enabled)
+            if (shizonet_enabled)
                 send_shz_poll();
 
             //m_poll_broadcast_subnet_switch ^= 1;

@@ -61,23 +61,68 @@ namespace std
 #if defined(ARDUINO)
 
 #define SHZNET_PKT_MAX 1400
-
 #include <Arduino.h>
+
+#ifdef ARDUINO_ARCH_ESP32
+#include <esp_heap_caps.h>
+#endif
+
+/* Helper macros (ESP32-only, compile-time safe) */
+#if defined(ARDUINO_ARCH_ESP32)
+#define SHZ_FREE_HEAP() ESP.getFreeHeap()
+#define SHZ_FREE_PSRAM() ESP.getFreePsram()
+#else
+#define SHZ_FREE_HEAP() 0
+#define SHZ_FREE_PSRAM() 0
+#endif
+
 #ifdef SHIZONET_DEBUG
-#define NETPRNT(str) Serial.println(str)
-#define NETPRNT_FMT(str,...) Serial.print(str)
-#define NETPRNT_ERR(str) Serial.println(str)
+
+#define NETPRNT(str) \
+  do { \
+    Serial.print(str); \
+    Serial.print(" | heap="); Serial.print(SHZ_FREE_HEAP()); \
+    Serial.print(" psram="); Serial.println(SHZ_FREE_PSRAM()); \
+    Serial.flush(); \
+  } while (0)
+
+#define NETPRNT_FMT(fmt, ...) \
+  do { \
+    Serial.printf(fmt, __VA_ARGS__); \
+    Serial.print(" | heap="); Serial.print(SHZ_FREE_HEAP()); \
+    Serial.print(" psram="); Serial.println(SHZ_FREE_PSRAM()); \
+    Serial.flush(); \
+  } while (0)
+
+#define NETPRNT_ERR(str) \
+  do { \
+    Serial.print("ERR: "); \
+    Serial.print(str); \
+    Serial.print(" | heap="); Serial.print(SHZ_FREE_HEAP()); \
+    Serial.print(" psram="); Serial.println(SHZ_FREE_PSRAM()); \
+    Serial.flush(); \
+  } while (0)
+
 #else
+
 #define NETPRNT(str)
-#define NETPRNT_FMT(str,...)
+#define NETPRNT_FMT(fmt, ...)
 #define NETPRNT_ERR(str)
-#endif
+
+#endif /* SHIZONET_DEBUG */
+
 #ifdef SHIZONET_EVENT_LOG
-#define SHIZONETLOG(str,...) Serial.printf(str, __VA_ARGS__)
+#define SHIZONETLOG(fmt, ...) \
+  do { \
+    Serial.printf(fmt, __VA_ARGS__); \
+    Serial.printf(" | heap=%u psram=%u\n", SHZ_FREE_HEAP(), SHZ_FREE_PSRAM()); \
+  } while (0)
 #else
-#define SHIZONETLOG(str,...)
+#define SHIZONETLOG(fmt, ...)
 #endif
+
 #define PACKED_ATTR __attribute__((packed))
+
 #else
 
 #define SHZNET_PKT_MAX 1400
@@ -1327,11 +1372,11 @@ public:
 
     T* get()
     {
+#if !defined(ARDUINO)
+        std::unique_lock<std::mutex> _grd{ m_lock };
+#endif
         if (m_garbage.size())
         {
-#if !defined(ARDUINO)
-            std::unique_lock<std::mutex> _grd{ m_lock };
-#endif
             T* result = m_garbage.back();
             m_garbage.pop_back();
             return result;
@@ -1350,7 +1395,36 @@ enum network_buffer_static_type
     NETWORK_BUFFER_STATIC_LEDS_4CH = 4
 };
 
-template<const int _BUFF_SIZE, const int _BUFF_MAX, class BufferMarkerHeader> class shznet_async_buffer
+#ifdef ARDUINO
+using cursor_t = volatile uint32_t;
+#else
+#include <atomic>
+using cursor_t = std::atomic<uint64_t>;
+#endif
+
+#ifdef ARDUINO
+#define LOAD_CURSOR(v)    (v)
+#define STORE_CURSOR(v, x) ((v) = (x))
+#else
+#define LOAD_CURSOR(v)    ((v).load(std::memory_order_acquire))
+#define STORE_CURSOR(v, x) ((v).store((x), std::memory_order_release))
+#endif
+
+
+#include <cstring>
+
+#ifdef ARDUINO
+using cursor_t = volatile uint32_t;
+#define LOAD_CURSOR(v)    (v)
+#define STORE_CURSOR(v, x) ((v) = (x))
+#else
+#include <atomic>
+using cursor_t = std::atomic<uint64_t>;
+#define LOAD_CURSOR(v)    ((v).load(std::memory_order_acquire))
+#define STORE_CURSOR(v, x) ((v).store((x), std::memory_order_release))
+#endif
+
+template<const int _BUFF_SIZE, const int _BUFF_MAX, class BufferMarkerHeader> class shznet_async_buffer_spsc
 {
     struct BufferMarker
     {
@@ -1391,9 +1465,13 @@ template<const int _BUFF_SIZE, const int _BUFF_MAX, class BufferMarkerHeader> cl
         return true;
     }
 
+    char* current_data;
+    size_t current_size;
+    BufferMarkerHeader* current_header;
+
 public:
 
-    shznet_async_buffer()
+    shznet_async_buffer_spsc()
     {
         memset(m_buffers, 0, sizeof(BufferChunk) * _BUFF_MAX);
         m_write_index = 0;
@@ -1466,10 +1544,9 @@ public:
     }
 
     //read data of next buffer but DO NOT mark it as free yet!
-    char* read_peek(int32_t* max_len = 0, BufferMarkerHeader* header_data = 0)
+    bool read()
     {
-        if (max_len)
-            *max_len = 0;
+        
         //pre read check
         if (m_missed_chunks)
         {
@@ -1521,22 +1598,24 @@ public:
             if (!buf.start.is_valid)
                 return 0;
 
-            if (header_data) memcpy(header_data, &buf.start.header, sizeof(BufferMarkerHeader));
-            if (max_len)
+            auto max_len = buf.start.size;
+            if (max_len > _BUFF_SIZE)
             {
-                *max_len = buf.start.size;
-                if (*max_len > _BUFF_SIZE)
-                {
-                    NETPRNT_FMT("invalid size error 1 %i!", *max_len);
-                    *max_len = _BUFF_SIZE;
-                }
-                if (*max_len < 0)
-                {
-                    NETPRNT_FMT("invalid size error 2 %i!", *max_len);
-                    *max_len = 0;
-                }
+                NETPRNT_FMT("invalid size error 1 %i!", max_len);
+                max_len = _BUFF_SIZE;
             }
-            return buf.data;
+            if (max_len < 0)
+            {
+                NETPRNT_FMT("invalid size error 2 %i!", max_len);
+                max_len = 0;
+            }
+            
+
+            current_data = buf.data;
+            current_size = max_len;
+            current_header = &buf.start.header;
+
+            return true;
         }
 
         BufferMarker* mark = (BufferMarker*)&buf.data[read_part_index];
@@ -1545,27 +1624,42 @@ public:
         if (!mark->is_valid)
             return 0;
 
-        if (header_data) memcpy(header_data, &mark->header, sizeof(BufferMarkerHeader));
-        if (max_len)
+        size_t max_len = mark->size;
+        if (max_len > _BUFF_SIZE)
         {
-            *max_len = mark->size;
-            if (*max_len > _BUFF_SIZE)
-            {
-                NETPRNT_FMT("invalid size error 3 %i!", *max_len);
-                *max_len = _BUFF_SIZE;
-            }
-            if (*max_len < 0)
-            {
-                NETPRNT_FMT("invalid size error 4 %i!", *max_len);
-                *max_len = 0;
-            }
+            NETPRNT_FMT("invalid size error 3 %i!", max_len);
+            max_len = _BUFF_SIZE;
         }
-        return mark_data;
+        if (max_len < 0)
+        {
+            NETPRNT_FMT("invalid size error 4 %i!", max_len);
+            max_len = 0;
+        }
+        
+
+        current_data = mark_data;
+        current_size = max_len;
+        current_header = &mark->header;
+
+        return true;
     }
+
+    char* read_data() const { return current_data; }
+
+    // ------------------------------------------------------------
+    // READ SIZE
+    // ------------------------------------------------------------
+    uint32_t read_size() const { return current_size; }
+
+    BufferMarkerHeader& read_header()
+    {
+        return *current_header;
+    }
+
 
     //this can be used to flush (free) a buffer peek'd by read_peek, its better to not use it directly as its not thread safe in case
     //of a buffer overrun
-    char* read(int32_t* max_len = 0, BufferMarkerHeader* header_data = 0)
+    bool read_commit()
     {
         //pre read check
         if (m_missed_chunks)
@@ -1616,13 +1710,10 @@ public:
             if (!buf.start.is_valid)
                 return 0;
 
-            if (header_data) memcpy(header_data, &buf.start.header, sizeof(BufferMarkerHeader));
-            if (max_len) *max_len = buf.start.size;
-
             buf.start.is_valid = 0;
             m_read_part_index = buf.start.size;
 
-            return buf.data;
+            return true;
         }
 
         BufferMarker* mark = (BufferMarker*)&buf.data[m_read_part_index];
@@ -1631,52 +1722,12 @@ public:
         if (!mark->is_valid)
             return 0;
 
-        if (header_data) memcpy(header_data, &mark->header, sizeof(BufferMarkerHeader));
-        if (max_len) *max_len = mark->size;
-
         mark->is_valid = 0;
         m_read_part_index += sizeof(BufferMarker) + mark->size;
 
-        return mark_data;
+        return true;
     }
 };
-
-template<const int _BUFF_SIZE, const int _BUFF_MAX, class BufferMarkerHeader> class shznet_async_buffer_mpsc
-{
-    shznet_async_buffer<_BUFF_SIZE, _BUFF_MAX, BufferMarkerHeader> inner;
-
-    std::mutex lock;
-
-public:
-
-    bool write(byte* data, int32_t size, BufferMarkerHeader* header_data = 0)
-    {
-        //std::unique_lock _grd{ lock };
-        return inner.write(data, size, header_data);
-    }
-
-    bool empty()
-    {
-        return inner.empty();
-    }
-
-    //read data of next buffer but DO NOT mark it as free yet!
-    char* read_peek(int32_t* max_len = 0, BufferMarkerHeader* header_data = 0)
-    {
-        //std::unique_lock _grd{ lock };
-        return inner.read_peek(max_len, header_data);
-    }
-
-    //this can be used to flush (free) a buffer peek'd by read_peek, its better to not use it directly as its not thread safe in case
-    //of a buffer overrun
-    char* read(int32_t* max_len = 0, BufferMarkerHeader* header_data = 0)
-    {
-        //std::unique_lock _grd{ lock };
-        return inner.read(max_len, header_data);
-    }
-};
-
-
 
 /*
 #include <atomic>
@@ -1864,9 +1915,10 @@ protected:
     };
 
     shznet_timer m_sendbuffer_wait = shznet_timer(1);
-    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, SHZNET_PKT_MAX_ASYNC, shznet_ip> m_sendbuffer;
-    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, SHZNET_PKT_MAX_ASYNC, shznet_ip> m_sendbuffer_prio;
-    shznet_async_buffer_mpsc<sizeof(shznet_pkt_diagnostic), SHZNET_PKT_MAX_ASYNC_DIAG, shznet_async_header> m_sendbuffer_diagnostic;
+    //Maybe change this to mpsc with a locked outer class?
+    shznet_async_buffer_spsc<SHZNET_PKT_MAX, SHZNET_PKT_MAX_ASYNC, shznet_ip> m_sendbuffer;
+    shznet_async_buffer_spsc<SHZNET_PKT_MAX, SHZNET_PKT_MAX_ASYNC, shznet_ip> m_sendbuffer_prio;
+    shznet_async_buffer_spsc<sizeof(shznet_pkt_diagnostic), SHZNET_PKT_MAX_ASYNC_DIAG, shznet_async_header> m_sendbuffer_diagnostic;
 
     bool sendbuffer_queue_free()
     {
@@ -2028,40 +2080,41 @@ public:
 
     virtual void update()
     {
-        int32_t max_len = 0;
-        char* data = 0;
 
         shznet_async_header adr_async;
 
-        while ((data = m_sendbuffer_diagnostic.read_peek(&max_len, &adr_async)) != 0)
+        while (m_sendbuffer_diagnostic.read())
         {
-            if (!send_packet_diagnostic(adr_async.ip, (shznet_pkt_diagnostic*)data, adr_async.timestamp_recv))
+            if (!send_packet_diagnostic(adr_async.ip, (shznet_pkt_diagnostic*)m_sendbuffer_diagnostic.read_data(), adr_async.timestamp_recv))
             {
                 m_sendbuffer_wait.reset();
                 return;
             }
-            m_sendbuffer_diagnostic.read();
+
+            m_sendbuffer_diagnostic.read_commit();
         }
 
-        shznet_ip adr;
-
-        while ((data = m_sendbuffer_prio.read_peek(&max_len, &adr)) != 0)
+        while (m_sendbuffer_prio.read())
         {
-            if (!send_packet_prio(adr, (byte*)data, max_len))
+            if (!send_packet_prio(m_sendbuffer_prio.read_header(),
+                (byte*)m_sendbuffer_prio.read_data(),
+                m_sendbuffer_prio.read_size()))
             {
                 m_sendbuffer_wait.reset();
                 return;
             }
-            m_sendbuffer_prio.read();
+            m_sendbuffer_prio.read_commit();
         }
-        while ((data = m_sendbuffer.read_peek(&max_len, &adr)) != 0)
+        while (m_sendbuffer.read())
         {
-            if (!send_packet_prio(adr, (byte*)data, max_len))
+            if (!send_packet(m_sendbuffer.read_header(),
+                (byte*)m_sendbuffer.read_data(),
+                m_sendbuffer.read_size()))
             {
                 m_sendbuffer_wait.reset();
                 return;
             }
-            m_sendbuffer.read();
+            m_sendbuffer.read_commit();
         }
     }
 
@@ -2414,21 +2467,12 @@ public:
 
     void debug_keys()
     {
-#ifdef ARDUINO
-        index = 0;
-        while (read())
-        {
-            Serial.printf("KEY: %s\n", get_key());
-        }
-        index = 0;
-#else
         index = 0;
         while (read())
         {
             printf("KEY: %s\n", get_key());
         }
         index = 0;
-#endif
     }
 };
 
@@ -2460,7 +2504,7 @@ class GenericESPSocket : public GenericUDPSocket
     }PACKED_ATTR;
 #pragma pack(pop)
 
-    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, MAX_ESP_BUFFERS, packet_buffer_header> m_asyncbuffer;
+    shznet_async_buffer_spsc<SHZNET_PKT_MAX, MAX_ESP_BUFFERS, packet_buffer_header> m_asyncbuffer;
 
     AsyncUDP m_udp;
 
@@ -2515,31 +2559,26 @@ public:
         //pre read check
         if (missed_packets)
         {
-            Serial.println("\nMissed Packets!");
             missed_packets = false;
         }
 
-        packet_buffer_header header;
-
-        while (true)
+        while (m_asyncbuffer.read())
         {
-            auto data = m_asyncbuffer.read_peek(max_len, &header);
+            auto& header = m_asyncbuffer.read_header();
 
-            if (!data)
-                return 0;
-
+            *max_len = m_asyncbuffer.read_size();
             if (recv_time) *recv_time = header.recv_time;
 
             memcpy(info.ip, (void*)&header.ip[0], 4);
             info.port = header.port;
 
-            if (preprocess_packet(info, (byte*)data, *max_len))
+            if (preprocess_packet(info, (byte*)m_asyncbuffer.read_data(), *max_len))
             {
-                m_asyncbuffer.read();
+                m_asyncbuffer.read_commit();
                 continue;
             }
 
-            return data;
+            return m_asyncbuffer.read_data();
         }
 
         return 0;
@@ -2547,7 +2586,7 @@ public:
 
     void flush_packet() override
     {
-        m_asyncbuffer.read();
+        m_asyncbuffer.read_commit();
     }
 
     shznet_timer max_looper_timeout = shznet_timer(5000);
@@ -2578,7 +2617,6 @@ public:
         */
         if (res != len)
         {
-            Serial.print("sendto failed!\n");
             vTaskDelay(1);
         }
 
@@ -2772,13 +2810,13 @@ class GenericOSUDPSocket : public GenericUDPSocket
         uint64_t recv_time;
     }PACKED_ATTR;
 
-    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 1024 * 10, packet_buffer_header> m_asyncbuffer; //asyncrecv
-    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 1024 * 10, shznet_ip> m_asyncsend;
-    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 256, shznet_ip> m_asyncsend_artnet;
-    shznet_async_buffer_mpsc<SHZNET_PKT_MAX, 256, shznet_ip> m_asyncsend_prio;
-    shznet_async_buffer_mpsc<sizeof(shznet_pkt_diagnostic), 256, shznet_async_header> m_asyncsend_diagnostic;
+    shznet_async_buffer_spsc<SHZNET_PKT_MAX, 1024 * 10, packet_buffer_header> m_asyncbuffer; //asyncrecv
+    shznet_async_buffer_spsc<SHZNET_PKT_MAX, 1024 * 10, shznet_ip> m_asyncsend;
+    shznet_async_buffer_spsc<SHZNET_PKT_MAX, 256, shznet_ip> m_asyncsend_artnet;
+    shznet_async_buffer_spsc<SHZNET_PKT_MAX, 256, shznet_ip> m_asyncsend_prio;
+    shznet_async_buffer_spsc<sizeof(shznet_pkt_diagnostic), 256, shznet_async_header> m_asyncsend_diagnostic;
 
-    shznet_async_buffer_mpsc<sizeof(shznet_pkt_diagnostic), 256, shznet_async_header> m_async_diag_response;
+    shznet_async_buffer_spsc<sizeof(shznet_pkt_diagnostic), 256, shznet_async_header> m_async_diag_response;
 
 
     volatile bool       m_threads_active = 1;
@@ -3238,21 +3276,23 @@ class GenericOSUDPSocket : public GenericUDPSocket
 
         while (m_threads_active)
         {
-            int32_t max_len = 0;
-            shznet_ip adr;
-
             const int wait_time = 1000;
 
             while (m_threads_active)
             {
-                shznet_async_header hdr;
-                shznet_pkt_diagnostic* diag_pkt = (shznet_pkt_diagnostic*)m_async_diag_response.read(&max_len, &hdr);
-                if (!diag_pkt)
+                if (!m_async_diag_response.read())
                     break;
 
-                auto it = m_send_endpoints.find(hdr.ip);
-                if (it != m_send_endpoints.end())
-                    it->second->handle_diagnostics_endpoint(diag_pkt, hdr.timestamp_recv);
+                shznet_pkt_diagnostic* diag_pkt = (shznet_pkt_diagnostic*)m_async_diag_response.read_data();
+
+                if (m_async_diag_response.read_size() >= sizeof(shznet_pkt_diagnostic))
+                {
+                    auto it = m_send_endpoints.find(m_async_diag_response.read_header().ip);
+                    if (it != m_send_endpoints.end())
+                        it->second->handle_diagnostics_endpoint(diag_pkt, m_async_diag_response.read_header().timestamp_recv);
+                }
+
+                m_async_diag_response.read_commit();
             }
 
             if (m_send_loop_cleanup_check.update())
@@ -3278,73 +3318,96 @@ class GenericOSUDPSocket : public GenericUDPSocket
 
             shuffle_devices ^= 1;
 
-            auto chunk = m_asyncsend_artnet.read_peek(&max_len, &adr);
-            if (chunk)
+            if (m_asyncsend_artnet.read())
             {
                 is_sending_data = true;
-                if (send_packet_to_interface(adr, (byte*)chunk, max_len))
+                if (send_packet_to_interface(m_asyncsend_artnet.read_header(),
+                    (byte*)m_asyncsend_artnet.read_data(),
+                    m_asyncsend_artnet.read_size()))
                 {
-                    m_asyncsend_artnet.read();
-                }
-                else
-                    continue;
-            }
-
-            shznet_async_header adr_async;
-            chunk = m_asyncsend_diagnostic.read_peek(&max_len, &adr_async);
-            if (chunk)
-            {
-                is_sending_data = true;
-                if (send_loop_try_send(adr_async.ip, (byte*)chunk, max_len, SEND_PKT_DIAGNOSTIC, adr_async.timestamp_recv))
-                {
-                    m_asyncsend_diagnostic.read();
+                    m_asyncsend_artnet.read_commit();
                 }
                 else
                 {
-                    high_resolution_wait(wait_time);
-                    continue;
-                }
-            }
-            chunk = m_asyncsend_prio.read_peek(&max_len, &adr);
-            if (chunk)
-            {
-                is_sending_data = true;
-                if (send_loop_try_send(adr, (byte*)chunk, max_len, SEND_PKT_PRIO))
-                {
-                    m_asyncsend_prio.read();
-                }
-                else
-                {
-                    high_resolution_wait(wait_time);
-                    continue;
-                }
-            }
-            chunk = m_asyncsend.read_peek(&max_len, &adr);
-            if (chunk)
-            {
-                is_sending_data = true;
-                if (send_loop_try_send(adr, (byte*)chunk, max_len, SEND_PKT_NORMAL))
-                {
-                    m_asyncsend.read();
-                }
-                else
-                {
-                    high_resolution_wait(wait_time);
-                    continue;
-                }
-            }
-
 #ifdef _WIN32
-            high_resolution_wait(wait_time);
+                    high_resolution_wait(wait_time);
 #else
+                    m_sendsignal.wait_for(_grd, std::chrono::milliseconds(1));
+#endif
+                    continue;
+                }
+            }
+
+            if (m_asyncsend_diagnostic.read())
+            {
+                is_sending_data = true;
+                if (send_loop_try_send(m_asyncsend_diagnostic.read_header().ip,
+                    (byte*)m_asyncsend_diagnostic.read_data(),
+                    m_asyncsend_diagnostic.read_size(), SEND_PKT_DIAGNOSTIC,
+                    m_asyncsend_diagnostic.read_header().timestamp_recv))
+                {
+                    m_asyncsend_diagnostic.read_commit();
+                }
+                else
+                {
+#ifdef _WIN32
+                    high_resolution_wait(wait_time);
+#else
+                    m_sendsignal.wait_for(_grd, std::chrono::milliseconds(1));
+#endif
+                    continue;
+                }
+            }
+
+            if (m_asyncsend_prio.read())
+            {
+                is_sending_data = true;
+                if (send_loop_try_send(m_asyncsend_prio.read_header(),
+                    (byte*)m_asyncsend_prio.read_data(),
+                    m_asyncsend_prio.read_size(), SEND_PKT_PRIO))
+                {
+                    m_asyncsend_prio.read_commit();
+                }
+                else
+                {
+#ifdef _WIN32
+                    high_resolution_wait(wait_time);
+#else
+                    m_sendsignal.wait_for(_grd, std::chrono::milliseconds(1));
+#endif
+                    continue;
+                }
+            }
+
+            if (m_asyncsend.read())
+            {
+                is_sending_data = true;
+                if (send_loop_try_send(m_asyncsend.read_header(),
+                    (byte*)m_asyncsend.read_data(),
+                    m_asyncsend.read_size(), SEND_PKT_NORMAL))
+                {
+                    m_asyncsend.read_commit();
+                }
+                else
+                {
+#ifdef _WIN32
+                    high_resolution_wait(wait_time);
+#else
+                    m_sendsignal.wait_for(_grd, std::chrono::milliseconds(1));
+#endif
+                    continue;
+                }
+            }
+
             if (is_sending_data)
             {
                 is_sending_data = false;
                 keep_thread_alive = true;
                 keep_alive_timer.reset();
+                continue;
             }
 
-            if (keep_thread_alive)
+            /*if (keep_thread_alive)
             {
                 if (keep_alive_timer.update())
                 {
@@ -3352,8 +3415,11 @@ class GenericOSUDPSocket : public GenericUDPSocket
                 }
                 high_resolution_wait(wait_time);
                 continue;
-            }
+            }*/
 
+#ifdef _WIN32
+            high_resolution_wait(wait_time);
+#else
             m_sendsignal.wait_for(_grd, std::chrono::milliseconds(1));
 #endif
         }
@@ -3514,16 +3580,17 @@ public:
 
     char* read_packet(shznet_ip& info, int32_t* max_len, uint64_t* recv_time) override
     {
-        packet_buffer_header hdr;
-        auto pkt_data = m_asyncbuffer.read_peek(max_len, &hdr);
-        info = hdr.ip;
-        if (recv_time) *recv_time = hdr.recv_time;
-        return pkt_data;
+        if (!m_asyncbuffer.read())
+            return 0;
+        info = m_asyncbuffer.read_header().ip;
+        if (max_len) *max_len = m_asyncbuffer.read_size();
+        if (recv_time) *recv_time = m_asyncbuffer.read_header().recv_time;
+        return m_asyncbuffer.read_data();
     }
 
     void flush_packet() override
     {
-        m_asyncbuffer.read();
+        m_asyncbuffer.read_commit();
     }
 
     bool send_packet_to_interface(shznet_ip& info, unsigned char* buffer, int32_t len) override
@@ -3728,13 +3795,13 @@ struct artnet_sync
 
 struct artnet_dmx
 {
-    char ID[8] = "Art-Net";
+    char ID[8] = { 'A','r','t','-','N','e','t','\0' };
     int16_t opcode = ART_DMX;
-    int16_t prot_ver = reverse_bits<int16_t>(14);
+    uint16_t prot_ver = ntohs(14);
     byte seq = 0;
     byte phy = 0;
-    int16_t universe = 0;
-    int16_t length = 0;
+    uint16_t  universe = 0;             // 0–15
+    int16_t  length = 0;
     byte data[512] = { 0 };
 }PACKED_ATTR;
 

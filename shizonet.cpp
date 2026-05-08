@@ -393,7 +393,9 @@ void shznet_device::handle_response_failed(shznet_ticketid id)
 void shznet_artnet_device::send_art_universe(int universe, byte* data, int len, uint8_t seq)
 {
     if (!base) return;
-    base->send_art_universe(get_ip(), universe, data, len, seq);
+    auto adr = get_ip();
+    adr.port = ART_NET_PORT;
+    base->send_art_universe(adr, universe, data, len, seq);
 }
 
 
